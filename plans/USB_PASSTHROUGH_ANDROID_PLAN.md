@@ -151,7 +151,8 @@ daemon 重啟重建表。用 CLI 對 IPC 打，不靠 UI。
 
 階段 C —— app 三個頁面 + 事件刷新；階段 D —— 自動規則（開機掃一次、插入即接、衝突）。
 
-回歸：unprotected VM 照常；VM `usb=false` 完全沒 xHCI；兩個 VM 搶同一顆裝置只能一個成功。
+回歸：VM `usb=false` 完全沒 xHCI；兩個 VM 搶同一顆裝置只能一個成功。Unprotected 模式本地手機不可用
+（只有聯發科、Google、8 Elite Gen 6 以後的平台有），不列入驗收。
 
 ## 6. 里程碑
 - M1 crosvm gate + 階段 A（實機證明機制通）。

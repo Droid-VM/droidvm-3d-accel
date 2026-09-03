@@ -230,7 +230,9 @@ host 端 USB：
    無錯、host log 無 lent-memory；
 2. OTG 插隨身碟 → attach → guest `lsusb` / `dd` 讀寫 → detach / 拔除；
 3. 鍵盤滑鼠（interrupt）、USB serial（cdc-acm，bulk）、USB 網卡；
-4. 回歸：unprotected VM 照常；pseudo-unprotected + Windows 有 USB；protected + Windows 預設無 xHCI。
+4. 回歸：pseudo-unprotected + Windows 有 USB；protected + Windows 預設無 xHCI。
+   （Unprotected 模式不驗：本地手機都是消費級高通，Unprotected 只在聯發科、Google 和 8 Elite Gen 6
+   以後的平台可用；gate 對它的放行只是保留上游行為。）
 
 ## 7. EDK2 要不要改？Windows 驅動 repo 要怎麼配合？（2026-09-04 追問）
 
