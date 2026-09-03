@@ -270,3 +270,37 @@ host 端 USB：
 - 一句話：Windows 驅動 repo 為 USB **不需要改**；要配合的是 app/crosvm 端「protected Windows 不給
   xHCI、pseudo-unprotected 才給」。
 
+## 8. 實機驗收紀錄（2026-09-04，5568）
+
+crosvm `wip/usb`：`ddb15e0` 拿掉 gate（protected 類型只在沒有 swiotlb 時關 USB；非 aarch64 維持上游
+行為）、`cb99117` xHCI 改用 QEMU 的 PCI id `1b36:000d`。手動 launcher 跑，不經 app。
+
+**Linux protected（`--protected-vm-without-firmware --swiotlb 256`，stock Ubuntu 7.0.0-30）— 通過，兩輪。**
+- `lspci`：`00:04.0 USB controller [0c03]: Red Hat, Inc. QEMU XHCI Host Controller [1b36:000d]`；
+  dmesg `xhci_hcd 0000:00:04.0: assigned reserved memory node restricted_dma_reserved@170000000`；
+  host log `host access to lent memory` 0 筆。換 id 後 `quirks 0x10`（原 `0x50`），沒有任何 MSI /
+  legacy / TRUST_TX_LENGTH 相關警告。R1 成立。
+- 三顆裝置 `crosvm usb attach` 皆 `ok <port>`：隨身碟 `090c:1000` → guest usb-storage、`sda1` NTFS
+  唯讀掛載讀到檔案，`dd` 128 MiB 15.4 MB/s（USB 2.0 hub，三次拷貝；效能待議）；讀卡機 `1403:7506`
+  （host 無驅動）→ guest 讀齊 CCID descriptor；網卡 `0bda:8153` → guest r8152 綁上、`enx…` 出現，
+  host `eth0` 消失。`usb list` = `devices 1 090c 1000 2 1403 7506 3 0bda 8153`。
+- detach 後 guest `USB disconnect`；host 介面全部 unbound（證實 kernel 不重綁）→ `drivers_probe`
+  後 usb-storage / r8152 回來、vold 重掛 `public:8,97`。`systemctl poweroff` 5～8 秒內 crosvm 退出，
+  `pool_avail` 回到 3072、`active_vms=0 served=0`。
+- host log 的三條雜訊每輪都在、與功能無關：開機時 `Write to crcr while command ring is running`
+  （EDK2 交棒給 OS），attach 時 `device slot is already enabled`、`endpoint is stalled. set state to
+  Halted`（descriptor 掃描）。
+
+**Windows pseudo-unprotected（Windows 11 LTSC 26100）— 第一輪失敗，原因是 PCI id。**
+- pseudo 模式本身正常：shim 10 ms 分享整段視窗、零 lent-memory，host 端三顆 attach 也都 `ok`。
+- 但 guest 的 xHCI 停在 `CM_PROB_FAILED_INSTALL`：inbox `usbxhci.inf` 的 `[Generic.Install.NT]` 有
+  `ExcludeID=PCI\VEN_1B73&DEV_1000&CC_0C0330` 與 `ExcludeID=PCI\VEN_1B73&DEV_1400&CC_0C0330`，
+  正好是 crosvm 寫死的 Fresco Logic FL1400。上游選它是為了讓 Linux 套 `XHCI_BROKEN_MSI`，但 crosvm 的
+  xHCI 沒有 MSI capability（Linux 自己退回 INTx），short packet 也回 `COMP_SHORT_PACKET`，Fresco 的
+  quirk 一個都不需要 → 改 `1b36:000d`（qemu-xhci）。第二輪 Windows 驗證進行中。
+
+app `wip/usb`：`32f7711` daemon runtime attach（見 USB_PASSTHROUGH_ANDROID_PLAN.md §2、§3；三路
+審查後修正：attach 與 VM 停止的競態用 stop-epoch 解、CLI 逾時改成先 waitFor 再 SIGKILL 並 reap、
+attach 失敗也還原 host 驅動、VMM 已不在時 detach 仍可清記錄、daemon 關閉時收尾）。階段 B（經 app
+daemon 的端到端）待 APK 重打包後執行。
+
