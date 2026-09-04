@@ -367,3 +367,33 @@ attach 失敗也還原 host 驅動、VMM 已不在時 detach 仍可清記錄、d
 - 部署注意：APK 升級後 app 會停在 setup 精靈的「預建置檔案解壓成功」頁等人按下一步，daemon 只有
   MainActivity 才會起；升級也不會殺掉舊的 root daemon，要 `stop-all` → `kill <pid>` → `force-stop` → 重開。
 
+## 9. Isochronous（M6，2026-09-04 開工）
+
+現況（code map 見 scratchpad `m6-iso-codemap.md`）：`endpoint.rs` 的 `handle_transfer` 在 transfer-type
+與 endpoint-type 兩個 match 都沒有 Isochronous 分支；`usb_util::Transfer::new_isochronous` 送空的
+packet 陣列（usbfs 回 EINVAL），也沒設 `ISO_ASAP`；reap 回來的 `iso_frame_desc[i].actual_length/status`
+從未被讀；**ring buffer controller 每次完成才 dequeue 下一個 TD（深度 1）**，這對 isochronous 是結構性
+的 underrun，補 packet 語意也救不了。
+
+v1 設計：
+- xHCI 規範一個 Isoch TD = 一個 packet（Linux `xhci_queue_isoc_tx` 每個 packet 一個 TD；Windows 同），
+  所以一個 TD → 一個 `number_of_packets=1`、`ISO_ASAP` 的 usbfs URB，packet 長度 = TD 的 TRB 長度總和；
+  usbfs 會用同一份端點描述元檢查上限，guest 給的長度本來就來自那份描述元。
+- 深度：endpoint context type 為 Isoch OUT(1)/IN(5) 的 ring，在每次事件把 ring 上所有 TD 一次 dequeue
+  送出（`RingBufferController::set_dequeue_all`），等於真實硬體逐 frame 走完整條 ring；bulk / interrupt /
+  control 維持深度 1，行為不變。
+- 逐 packet 結果：讀 `iso_frame_desc[0]`；短包走既有 ShortPacket 事件（residual = TRB 長度 − actual，
+  Linux 反推 actual_length）；packet 級錯誤（-EXDEV 漏服務、-EPROTO、-EOVERFLOW）v1 先回 0 byte 短包
+  （guest 看到一個空 frame），URB 級 ENODEV/ENOENT/EPIPE 維持現有對應。
+- v1 不存 max packet size / interval、不做批次、不動 1 MiB DMA 視窗（iso 封包多半退回 Vec，拷貝成本
+  在 USB 2.0 頻寬下可忽略）；缺的完成碼（MissedService 10、RingUnderrun 14、RingOverrun 15、
+  IsochBufferOverrun 31）與 BEI 留給 v2。
+
+拷貝次數：isochronous 的下限是 host 端 1 次（usbfs 只收自己 mmap 的 coherent 緩衝或任意使用者指標，
+後者 kernel 會 copy）。Linux 的 snd-usb-audio / uvcvideo 用 `usb_alloc_coherent` /
+`dma_alloc_noncontiguous` 配 iso 緩衝，在 restricted pool 下直接落在池裡，沒有 swiotlb 反彈；Windows
+pseudo-unprotected 更沒有。真正決定成敗的是 packet 語意與深度，不是拷貝。
+
+驗證需要有 isochronous 端點的裝置：USB 音效（UAC1 耳麥/DAC：iso OUT + IN，時序最嚴）與 UVC 攝影機
+（iso IN 大頻寬，選 MJPEG）。5568 目前的三顆（隨身碟、r8152、CCID 讀卡機）都只有 bulk/interrupt。
+
