@@ -323,7 +323,19 @@ crosvm `wip/usb`：`ddb15e0` 拿掉 gate（protected 類型只在沒有 swiotlb 
   `CreateBuffer` → 致命。順帶兩個 Windows 才在乎的錯誤：Event Data 事件的完成碼一律 Success（stall /
   short 也是）、指向 TRB 的事件卻把 ED 旗標設成 1（Linux 不看 ED）。修法：buffer 接受並跳過 Event Data
   TRB、Event Data 事件按 TD 結果給碼、非 Event Data 事件 ED=0、Setup Stage 回報 8 bytes、後端拒絕原因
-  記進 log。修正驗證進行中。
+  記進 log → crosvm `d9735bf`。
+- **第四輪（`d9735bf`）— Windows 通過。** 三顆裝置全部 `CM_PROB_NONE`：隨身碟 `USB Mass Storage Device`
+  （Get-Disk：`UFD 2.0 Silicon-Power16G` 16 GB MBR；Get-Volume：D: NTFS；唯讀 `Get-ChildItem D:\` 列出
+  檔案）；讀卡機綁 inbox `Microsoft Usbccid Smartcard Reader (WUDF)`；網卡綁 `Realtek USB GbE Family
+  Controller`（Disconnected，無線材；MAC 00-E0-4C-68-04-3B 原樣透傳）。host log 零次 hub 重置，控制器整
+  段存活；剩下的 host log 雜訊與 Linux 相同（`device slot is already enabled`、r8152 列舉時一次 STALL，
+  Windows 自行恢復）。detach 後三顆從 PnP 消失，host 驅動還原、vold 重掛，`shutdown /s` 正常退出。
+  同版 Linux 回歸乾淨（無 xhci 警告、attach/讀/detach/還原全 OK）。
+
+**結論：目標達成（crosvm 層）。** Linux protected-without-firmware 與 Windows pseudo-unprotected 都讀到
+USB 裝置。crosvm `wip/usb` 三個 commit：`ddb15e0`（gate）、`cb99117`（PCI id）、`94773a3`（PORTSC
+link state / LWS / HCRST 還原）、`d9735bf`（Event Data TRB）。Windows 走 app 路徑（M5）待 APK 重打包後
+驗收。
 
 app `wip/usb`：`1527331` daemon runtime attach（見 USB_PASSTHROUGH_ANDROID_PLAN.md §2、§3；三路
 審查後修正：attach 與 VM 停止的競態用 stop-epoch 解、CLI 逾時改成先 waitFor 再 SIGKILL 並 reap、
