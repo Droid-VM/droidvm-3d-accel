@@ -325,8 +325,19 @@ crosvm `wip/usb`：`ddb15e0` 拿掉 gate（protected 類型只在沒有 swiotlb 
   TRB、Event Data 事件按 TD 結果給碼、非 Event Data 事件 ED=0、Setup Stage 回報 8 bytes、後端拒絕原因
   記進 log。修正驗證進行中。
 
-app `wip/usb`：`32f7711` daemon runtime attach（見 USB_PASSTHROUGH_ANDROID_PLAN.md §2、§3；三路
+app `wip/usb`：`1527331` daemon runtime attach（見 USB_PASSTHROUGH_ANDROID_PLAN.md §2、§3；三路
 審查後修正：attach 與 VM 停止的競態用 stop-epoch 解、CLI 逾時改成先 waitFor 再 SIGKILL 並 reap、
-attach 失敗也還原 host 驅動、VMM 已不在時 detach 仍可清記錄、daemon 關閉時收尾）。階段 B（經 app
-daemon 的端到端）待 APK 重打包後執行。
+attach 失敗也還原 host 驅動、VMM 已不在時 detach 仍可清記錄、daemon 關閉時收尾）。
+
+**階段 B（經 app daemon，APK `0.0.6.r218.g1527331`，5568 Ubuntu protected）— 通過。**
+- 三種路徑 attach（console 依名稱、IPC、console 依 id）皆 `ok`，guest lsusb / lsblk / r8152 證據齊；
+  `usb-vm`、`usb-list` 的 attached_vm/port 正確。
+- 七個錯誤路徑訊息與原始碼逐字一致（hub、不存在、重複 attach、錯 port、非數字 port、缺 device、VM 不存在）。
+- detach 依 sysfs 與依 port 都行，daemon 自動 `drivers_probe`，r8152 一秒內回來。
+- 第一輪抓到兩個 bug 並修掉：釋放做在 STOPPING（crosvm 還握著 usbfs，probe 被跳過，隨身碟停在無驅動
+  80 秒）→ 改成 STOPPED/REBOOTING 才釋放並等 `usbfs` link 消失；`usb-list` 的 driver 欄位是舊快照（inotify
+  看不到驅動綁定）→ 每次直接掃 sysfs。第二輪：vm_stop 後 1 秒 usb-storage 回來、vold 重掛（日誌：釋放在
+  `-> STOPPED` 之後 1 ms）、`usb-list` 即時、事件 `usb_vm_changed` / `usb_host_changed` 內容正確。
+- 部署注意：APK 升級後 app 會停在 setup 精靈的「預建置檔案解壓成功」頁等人按下一步，daemon 只有
+  MainActivity 才會起；升級也不會殺掉舊的 root daemon，要 `stop-all` → `kill <pid>` → `force-stop` → 重開。
 
