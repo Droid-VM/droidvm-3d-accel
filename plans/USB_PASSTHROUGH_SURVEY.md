@@ -297,7 +297,23 @@ crosvm `wip/usb`：`ddb15e0` 拿掉 gate（protected 類型只在沒有 swiotlb 
   `ExcludeID=PCI\VEN_1B73&DEV_1000&CC_0C0330` 與 `ExcludeID=PCI\VEN_1B73&DEV_1400&CC_0C0330`，
   正好是 crosvm 寫死的 Fresco Logic FL1400。上游選它是為了讓 Linux 套 `XHCI_BROKEN_MSI`，但 crosvm 的
   xHCI 沒有 MSI capability（Linux 自己退回 INTx），short packet 也回 `COMP_SHORT_PACKET`，Fresco 的
-  quirk 一個都不需要 → 改 `1b36:000d`（qemu-xhci）。第二輪 Windows 驗證進行中。
+  quirk 一個都不需要 → 改 `1b36:000d`（qemu-xhci）。
+- 第二輪（`1b36:000d`）：Windows 綁上 inbox USBXHCI（`Standard USB 3.0 eXtensible Host Controller - 1.10
+  (Microsoft)`，Status OK，root hub OK），但第一次 attach 後 host log 0.83 秒內 9～10 次「stopping all
+  device slots and resetting host hub」，root hub 落到 `CM_PROB_FAILED_POST_START`（code 43），裝置從未出現。
+- **根因（ETW：USBXHCI + USBHUB3 + UCX providers，`logman` 抓、`tracerpt` 解碼）**：attach 的 port
+  change 把 root hub 從低功耗喚醒（`UCX RootHub Initiating Wake` → `EvtDeviceD0Entry`），USBHUB3 第一次
+  輪詢全部 16 個 port：port 1（隨身碟）讀到 `0x503`（連線＋enable＋高速）完全正常；但 **port 9～16（空的
+  USB 3.0 port）每個都讀到 `PortStatus=0x200`＝有電、無連線、link state = U0**，規範上空 SS port 必須是
+  RxDetect（`0x2A0`），於是每個 port 一條 `id=122 Hub Reset Request Due to Port Error`（8 port × 10 輪 = 80 條），
+  接著 `id=120 Start of Hub Reset Request` → USBXHCI `Controller Internal Reset`（每次都 NtStatus=0 成功），
+  port 狀態沒變 → 迴圈，九輪後放棄。crosvm log 的九次 HCRST 與 ETW 一一對應。
+  模型的兩個缺陷（`devices/src/usb/xhci/mod.rs` `portsc_callback`、`usb_hub.rs`）：PORTSC 沒有 LWS（bit 16）
+  門控，任何寫入都把 PLS 欄位直接存進去（Windows 寫 0；Linux 的 `xhci_port_state_to_neutral` 會保留 PLS，
+  所以 Linux 從沒踩到）；port reset 路徑無條件 `PLS=U0、PED=1`，空 port 也一樣；HCRST 不會把 PORTSC 還原成
+  重設值 `0x2A0`。修法：LWS 門控、reset 後空 port 回 RxDetect 且不 enable（有裝置才 U0＋enable，warm reset
+  另設 WRC）、`UsbHub::reset` 先把每個 port 還原成重設值再重新宣告仍接著的裝置。修正驗證進行中。
+  證據：scratchpad `win-etw/etw_timeline_key.txt`（ETW 時間線）、`attach_window_xhci.txt`。
 
 app `wip/usb`：`32f7711` daemon runtime attach（見 USB_PASSTHROUGH_ANDROID_PLAN.md §2、§3；三路
 審查後修正：attach 與 VM 停止的競態用 stop-epoch 解、CLI 逾時改成先 waitFor 再 SIGKILL 並 reap、
