@@ -312,8 +312,18 @@ crosvm `wip/usb`：`ddb15e0` 拿掉 gate（protected 類型只在沒有 swiotlb 
   門控，任何寫入都把 PLS 欄位直接存進去（Windows 寫 0；Linux 的 `xhci_port_state_to_neutral` 會保留 PLS，
   所以 Linux 從沒踩到）；port reset 路徑無條件 `PLS=U0、PED=1`，空 port 也一樣；HCRST 不會把 PORTSC 還原成
   重設值 `0x2A0`。修法：LWS 門控、reset 後空 port 回 RxDetect 且不 enable（有裝置才 U0＋enable，warm reset
-  另設 WRC）、`UsbHub::reset` 先把每個 port 還原成重設值再重新宣告仍接著的裝置。修正驗證進行中。
+  另設 WRC）、`UsbHub::reset` 先把每個 port 還原成重設值再重新宣告仍接著的裝置 → crosvm `94773a3`。
   證據：scratchpad `win-etw/etw_timeline_key.txt`（ETW 時間線）、`attach_window_xhci.txt`。
+- 第三輪（`94773a3`）：重置風暴消失，root hub 在 attach 後仍 OK，但 attach 後 134 ms host log
+  `removing event handler due to error: failed to send transfer to backend: failed to submit transfer to
+  backend`，xHCI 事件處理器被移除、模型停擺，10 秒後 Windows 列舉逾時才重置一次。內層錯誤被
+  `xhci_transfer.rs` 的 `map_err(|_| Error::SubmitTransfer)` 丟掉，只能讀碼定位：**Windows 的 USBXHCI 每個
+  TD 尾端都掛一個 Event Data TRB**（IOC 設在它上面，拿 TD 的累計長度 EDTLA），Linux 從不發；
+  `ScatterGatherBuffer::new` 只收 Normal / DataStage / Isoch，看到 EventData 回 `BadTrbType` →
+  `CreateBuffer` → 致命。順帶兩個 Windows 才在乎的錯誤：Event Data 事件的完成碼一律 Success（stall /
+  short 也是）、指向 TRB 的事件卻把 ED 旗標設成 1（Linux 不看 ED）。修法：buffer 接受並跳過 Event Data
+  TRB、Event Data 事件按 TD 結果給碼、非 Event Data 事件 ED=0、Setup Stage 回報 8 bytes、後端拒絕原因
+  記進 log。修正驗證進行中。
 
 app `wip/usb`：`32f7711` daemon runtime attach（見 USB_PASSTHROUGH_ANDROID_PLAN.md §2、§3；三路
 審查後修正：attach 與 VM 停止的競態用 stop-epoch 解、CLI 逾時改成先 waitFor 再 SIGKILL 並 reap、
