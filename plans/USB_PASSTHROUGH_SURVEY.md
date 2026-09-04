@@ -332,10 +332,24 @@ crosvm `wip/usb`：`ddb15e0` 拿掉 gate（protected 類型只在沒有 swiotlb 
   Windows 自行恢復）。detach 後三顆從 PnP 消失，host 驅動還原、vold 重掛，`shutdown /s` 正常退出。
   同版 Linux 回歸乾淨（無 xhci 警告、attach/讀/detach/還原全 OK）。
 
-**結論：目標達成（crosvm 層）。** Linux protected-without-firmware 與 Windows pseudo-unprotected 都讀到
-USB 裝置。crosvm `wip/usb` 三個 commit：`ddb15e0`（gate）、`cb99117`（PCI id）、`94773a3`（PORTSC
-link state / LWS / HCRST 還原）、`d9735bf`（Event Data TRB）。Windows 走 app 路徑（M5）待 APK 重打包後
-驗收。
+**M5（Windows 走 app daemon，APK `0.0.6.r218.g1527331` 內含 crosvm `d9735bf`）— 通過。**
+- `vm_modify` 把 Windows VM 設定改成 `pseudo_unprotected`（唯一變動的鍵；已永久生效），daemon 起的 argv
+  為 `--protected-vm-pseudo-unprotected`、無 `--swiotlb`。
+- `droidvm usb-attach` 三顆皆 OK：`USB Mass Storage Device`（Disk 1 Silicon-Power16G MBR、D: NTFS、唯讀列出
+  檔案）、`Microsoft Usbccid Smartcard Reader (WUDF)`、`Realtek USB GbE Family Controller`；`usb-vm` /
+  `usb-list` 的 attached_vm、port、driver=usbfs 正確。
+- detach 讀卡機與網卡 → guest PnP 消失，daemon 0.3 秒內 `drivers_probe`，r8152 回到 Android。
+- `vm_stop` 時隨身碟仍接著 → crosvm 退出後 daemon 釋放，2 秒 usb-storage 回來、5 秒 vold 重掛；事件
+  6 × `usb_vm_changed` / 6 × `usb_host_changed` 與動作一一對應。最終 pool 3072、`active_vms=0`。
+- 同一版本 Linux 煙霧（daemon 路徑）通過；獨立複核 58 項主張，判定 pass-with-notes（只有數字精度與
+  措辭問題，無矛盾）。
+
+**結論：目標達成。** Linux protected-without-firmware 與 Windows pseudo-unprotected，經 crosvm 手動
+launcher 與 app daemon 兩條路徑，都能 runtime attach 並讀到 USB 裝置。crosvm `wip/usb` 四個 commit：
+`ddb15e0`（gate）、`cb99117`（PCI id）、`94773a3`（PORTSC link state / LWS / HCRST 還原）、`d9735bf`
+（Event Data TRB）；app `1527331`（daemon runtime attach）。尚未做：M3 app UI、M4 自動接入規則、實體拔線
+測試、protected + Windows 在 UI 上的防呆。已知限制：上游不支援 isochronous（USB 音訊/多數攝影機）、
+USB 2.0 hub 上隨身碟約 15 MB/s。
 
 app `wip/usb`：`1527331` daemon runtime attach（見 USB_PASSTHROUGH_ANDROID_PLAN.md §2、§3；三路
 審查後修正：attach 與 VM 停止的競態用 stop-epoch 解、CLI 逾時改成先 waitFor 再 SIGKILL 並 reap、

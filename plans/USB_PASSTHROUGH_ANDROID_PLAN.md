@@ -1,5 +1,8 @@
 # USB 透傳：Android 端接線計劃（2026-09-04）
 
+> 狀態（2026-09-04 收工）：§2、§3、§5 階段 A/B 與 M5 已完成並實機驗收（見 USB_PASSTHROUGH_SURVEY.md §8）；
+> §4 app 頁面（M3）與 §2.4 自動規則（M4）未做。
+
 前提（USB_PASSTHROUGH_SURVEY.md 的結論）：Linux guest 走 protected + restricted-dma-pool，
 Windows guest 走 pseudo-unprotected；兩者 host 端機制相同，差別只在 crosvm 的 gate。本文只講
 Android 這一側：硬體、kernel、誰擁有裝置、daemon 的管理模型、app 的事件與頁面、驗證。
