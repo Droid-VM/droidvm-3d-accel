@@ -96,8 +96,10 @@ daemon 用 `FileObserver`（inotify，`app_process` 裡可用）盯 `/dev/bus/us
 | 裝置插入 | 對每個 RUNNING VM 跑規則 → attach；無人命中則只更新清冊 |
 | 使用者手動 attach / detach | 新 IPC（§2.6）→ attach/detach → 更新表 → 廣播 |
 | 裝置拔除（attach 中） | `crosvm usb detach` → 清表 → 廣播 |
-| VM → STOPPING / STOPPED / crosvm 死掉 | crosvm 退出自動放 fd；daemon 清掉該 VM 的表 → 對每個介面 `drivers_probe` 還給 Android → 廣播 |
+| VM → STOPPING | 只推進 stop epoch（讓還在 CLI 裡的 attach 事後被拒）；**不釋放**：crosvm 這時還活著、介面還是 `usbfs`，此時 `drivers_probe` 沒有用（實測踩到：在 STOPPING 釋放會讓隨身碟停在無驅動狀態） |
+| VM → STOPPED / REBOOTING / crosvm 死掉 | fd 已隨程序消失；daemon 清掉該 VM 的表 → 對每個介面等 `usbfs` link 消失後 `drivers_probe` 還給 Android → 廣播 |
 | daemon 啟動 | 掃清冊；對每個活著的 VM `crosvm usb list` 重建表 |
+| `usb_host_list` | 每次直接掃 sysfs 再回（driver 綁定變化不會動到 `/dev/bus/usb` 節點，inotify 看不到；實測快照會過期） |
 
 ### 2.6 IPC（daemon ↔ app，沿用 `daemon/ipc/vm/*Handler` 的樣子）
 - `usb_host_list` → 清冊 + 每顆的佔用者。
