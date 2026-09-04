@@ -397,3 +397,17 @@ pseudo-unprotected 更沒有。真正決定成敗的是 packet 語意與深度�
 驗證需要有 isochronous 端點的裝置：USB 音效（UAC1 耳麥/DAC：iso OUT + IN，時序最嚴）與 UVC 攝影機
 （iso IN 大頻寬，選 MJPEG）。5568 目前的三顆（隨身碟、r8152、CCID 讀卡機）都只有 bulk/interrupt。
 
+M6 v1 實作：crosvm `b0a47ea`（usb_util 的 `new_isochronous` 帶 packet 陣列 + `ISO_ASAP` + 逐 packet
+accessor；後端 `build_isochronous_transfer`；endpoint 的 Isochronous 分支；`RingBufferController::
+set_dequeue_all`；device_slot 對 endpoint context type 1/5 啟用）。兩路審查修掉四個 v1 設計盲點：
+- URB 狀態必須先於 packet 描述判定（我的 pseudo-code 順序錯了，會讓拔線的 NoDevice 被遮掉、port 不會 detach）。
+- drain 迴圈要有上限（256/事件，超過就自我 signal 下一輪）；ring 是 guest 記憶體，Link TRB 不翻 cycle
+  會讓它無限產出，且迴圈在 `state` 鎖內跑，會卡住整個事件迴圈。
+- Stop Endpoint 的 latch（`RingBufferStopCallback`）是每個 controller 一份、在第一次空 dequeue 就釋放；
+  有 N 個 in-flight 時會提前回報「已停」。加 `TransferDescriptorHandler::is_quiesced()`，只有 handler
+  沒有 pending TD 時才進 Stopped / 釋放 latch。
+- usbfs 拒絕單一 iso URB（例如 SET_INTERFACE 還沒落地前的 packet 超長）原本會被對應成 NoDevice 而拔掉
+  整個 port；改成掉一幀。
+驗證裝置（5568）：AB13X USB Audio `0020:0b21`（FS，iface1 alt1 EP 0x03 Isoc OUT 384 B、iface2 alt1
+EP 0x83 Isoc IN 208 B、bInterval 1）與 icSpring 攝影機 `32e6:9221`（HS，iface1 alt1～6 EP 0x82 Isoc IN
+1024×3 → 512×1 B/µframe、iface3 alt1 EP 0x85 Isoc IN 40 B 麥克風）。實機驗證進行中。
