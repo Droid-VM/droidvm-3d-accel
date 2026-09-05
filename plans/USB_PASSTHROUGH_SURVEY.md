@@ -799,7 +799,7 @@ command ring／CRCR／interrupter，開機前就接上的裝置會讓整台 xHCI
     mic **64044 B**、`speaker-test` rc=0，`vm_stop` 時歸還；Windows app VM 預先接上攝影機：PnP 全 OK、
     拍照 **182153 B**、錄影 **931222 B**，那一輪唯一的一次 Stop Endpoint 是 **0 ms**。當天 watchdog
     `HOST_REBOOT` **0**、OTG 掉線 **0**。
-- **新缺陷（Windows，run4 抓到；待修，設計 `DESIGN-STOPPED-STREAMS.md`）：stream 端點的一次 Stop Endpoint
+- **新缺陷（Windows，run4 抓到；待修，設計 `crosvm-xhci-designs/DESIGN-STOPPED-STREAMS.md`）：stream 端點的一次 Stop Endpoint
   不能每條 stream ring 各發一個 Stopped 事件。** UAS 冷接上那次，第一個 Stop Endpoint 時有 **兩條 stream**
   各有一顆 TD 在飛，crosvm 依修法二當初寫下的規則對每一條 stream ring 各發了一個 Stopped；Windows USBXHCI
   在同一毫秒記下 event 30 `Received duplicate Stopped Transfer Events`（`HWVerifierFlag=0x2000000`），
