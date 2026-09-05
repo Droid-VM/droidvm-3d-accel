@@ -471,6 +471,42 @@ xHCI 模型缺陷——不是 isochronous 的問題。**
 - 順帶查到、未修的次要缺陷：CRCR 的 Command Abort/Stop（CA/CS）沒實作，所以命令逾時時 Windows 的 abort 救不回來、
   直接升級成整台 reset（有了上面兩修正後不應再走到這裡）。
 
+**新缺陷（2026-09-05 深夜由 M4 的「VM 開機觸發」測出，crosvm `11c5462` 仍在，修正中）：HCRST 沒有重置
+command ring／CRCR／interrupter，開機前就接上的裝置會讓整台 xHCI 在 guest kernel 起來之前就死掉。**
+- 現象（5568 的 Ubuntu app VM，daemon 的自動接入規則在 `vm_start` 後約 10 秒 attach，也就是 guest firmware
+  還沒碰 xHCI 之前；3/3 必現）：`usb_hub: backend attached to port N` ＋ `port N changed before the guest set up
+  its event ring; the change waits in PORTSC`，1.2 ms 後 `device_slot: xhci: stopping all device slots and
+  resetting host hub`（guest firmware EDK2 XhciDxe 寫 USBCMD.HCRST），2 ms 後 ERROR `Write to crcr while command
+  ring is running`（firmware 的 CRCR 寫入被打回），再 170 ms 後 ERROR `removing event handler due to error:
+  cannot dequeue transfer descriptor: cannot read guest memory: invalid guest address 0x0`。事件處理器就此消失，
+  23 秒後才起來的 guest kernel 看到一台死的 controller：dmesg `Abort failed to stop command ring: -110 /
+  xHCI host controller not responding, assume dead / HC died; cleaning up`，`lsusb` 只剩兩顆 root hub。
+- 證據：scratchpad `m6b/m4/run2/3F-crosvm.log` 4532-4543、`3G-crosvm.log` 4836-4844（F/R/G 三次開機同一條鏈：
+  13:48:57.844/.847/58.017、13:54:02.642/.645/.815、13:58:56.306/.308/.479）。審核員比對歷史 log：
+  `stopping all device slots` ＋ `Write to crcr while command ring is running` 這一對**每次開機都出現**
+  （在 `display backend android opened` 之後約 270 ms，改版前 13 次），因為那時沒有任何 port 連線、firmware
+  不會發命令，所以一直無害；真正新的只有位址 0 那條（改版前 0 次、本輪 3 次）。kernel 自己 HCRST 之後約 5.5 秒
+  的第二條 CRCR 打回，是 kernel 命令逾時 5 秒後的 abort（CRCR.CA），是結果不是原因。
+- 根因：`xhci_regs.rs:322-330` 的 crcr 暫存器 `reset_value: 9` ＝ RCS（bit 0）| CRR（bit 3）——**CRR 從上電就是 1**，
+  而 `guest_writeable_mask` 0xFFFFFFFFFFFFFFC7 不讓 guest 寫 bit 3，guest 自己清不掉；`Xhci::reset()`
+  （`mod.rs:467`）只設 USBSTS.CNR、停 slot 的 transfer ring、重置 hub，**不碰 CRCR**（CRR 續留 →
+  `crcr_callback`（`mod.rs:313`）把 guest 的下一次 CRCR 寫入打回並回傳舊值，dequeue pointer 永遠沒被換過）、
+  不重置 command ring controller（初值 `GuestAddress(0)`）、不重置 interrupter 的暫存器與狀態
+  （IMAN/IMOD/ERSTSZ/ERSTBA/ERDP、event ring）、也不重置 DCBAAP/CONFIG；整個 crosvm 只有 USBCMD R/S=0 那條路
+  （`mod.rs:298`）會清 CRR。firmware 期間就有 port 連線時，firmware 會發 Enable Slot、敲 doorbell 0，
+  command ring controller 於是從 0x0 開始讀 TRB，`event_loop` 一收到錯誤就把整個處理器移除。
+- 規範（xHCI 1.2 §4.2、§5.4.1 USBCMD.HCRST、§5.4.5 CRCR）：HCRST 要「把內部狀態機與暫存器回到初始值」——
+  USBCMD=0（R/S=0）、USBSTS.HCH=1、CRCR=0（CRR=0、指標 0、RCS 0）、DCBAAP=0、CONFIG=0、DNCTRL=0、IMAN=0、
+  IMOD 預設、ERSTSZ/ERSTBA/ERDP=0、所有 device slot disable、port reset；CRCR 的預設值本來就是 0，
+  CRR 是它唯一可讀的位元。
+- 修法（進行中）：`Xhci::reset()` 等所有 ring 停妥之後一次做完——CRCR 歸 0、command ring controller 歸位
+  （dequeue pointer 0、consumer cycle 回初值、狀態 Stopped）、interrupter 回到「未初始化」的初始狀態
+  （event ring、IMAN/IMOD/ERSTSZ/ERSTBA/ERDP、moderation timer 解除）、DCBAAP/CONFIG 歸 0、USBSTS 清 CNR 並設
+  HCH；crcr 暫存器的 `reset_value` 改成 0（規範預設值），寫入遮罩維持不讓 guest 設 CRR。
+- 一併關掉的風險：`11c5462` 的延後 PORTSC 是靠「event ring 尚未初始化」判斷的，但 HCRST 之後 interrupter 還握著
+  firmware 那份 event ring；kernel 自己 HCRST 時 hub reset 重貼的 port change 事件會被寫進 firmware 的 ERST
+  記憶體——那塊記憶體已經歸 kernel 用了，是一條會默默弄髒 guest 記憶體的路。把 interrupter 一起重置就沒了。
+
 ### 9.2 Windows 重驗（2026-09-05，crosvm `4c6d149` → `d2f4b57`）
 
 `4c6d149`（moderation timer + halted ring + DCS + SETUP 重啟）裝上去後，Windows 這邊終於走到 isochronous：

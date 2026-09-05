@@ -159,6 +159,37 @@ for d in 候選:
 - 手機在驗收中途重啟一次（20:39:59，zygote SIGABRT `selinux_android_setcontext(... vendor.qti.frameworks.utils)`，
   bootreason=reboot、無 pstore），與 DroidVM 無關、不可重現；watchdog 見 `vmwatch.sh` / `debugloop.md`。
 
+**M4 第二輪驗收（2026-09-05 深夜，APK `0.0.6.r223.gf893906`＝crosvm `11c5462`（app 解出的副本 md5
+`69aa3984be32eeec993c6161b7cdc05d`）＋ daemon `f893906`；workflow ＋ 獨立審核）**
+
+| 情境 | daemon 端 | guest 端 |
+|---|---|---|
+| F：VM 開機觸發接入兩顆 | **PASS**。VM 沒跑時存規則 `applied=0`；`state=running`（13:48:47.53Z）之後 1-1.2.2（`device[0]`）在 +9.14 s、1-1.3（`device[1]`）在 +9.37 s 各發一個 `usb_auto_attached`，`usb-vm` 兩顆都列出，八個介面全部交給 usbfs | **FAIL**。`lsusb` 只剩兩顆 root hub（沒有 `0020:0b21`、沒有 `32e6:9221`），沒有 `/dev/video*`，dmesg [56.95] `HC died; cleaning up` |
+| R：`vm_reboot` 釋放再接回 | **PASS**。REBOOTING 就 `usb_vm_changed devices=[]`，同一個 tick 兩顆已經回到 snd-usb-audio/usbhid 與 uvcvideo/snd-usb-audio（沒有任何介面被留在無驅動狀態，`drivers_probe` 都是 code=0）；RUNNING 之後 +9.16 s／+9.40 s 再接入，`attached_vm` 重新設上、`held=false` | **FAIL**，同一條路：`lsusb` 只有 root hub，dmesg [57.25] HC died |
+| G：`vm: null` 留 host ＋ `any` 收尾 | **PASS，列出的每一條都過**。`vm_stop` 後約 0.15 秒兩顆就自己回到 host 驅動；規則存檔時 VM 沒跑 `applied=0`；攝影機只由 `any[0]` 接走（running+9.17 s），AB13X 完全沒被碰（`usb-rules test` 是 `port[0] -> host`、asound card 2 還在 host），`usb-vm` 剛好一顆 | 同一條 crosvm 失敗（不在 G 的驗收條件內）：攝影機在 guest 裡從來沒列舉出來，dmesg [49.17] HC died |
+| X：錯誤字串 | **PASS**，字串一字不差。`usb_attach device=1-1` → `refusing to attach a hub`；`device=9-9` → `no such USB device: 9-9`；另外測沒帶 vm_id → `missing vm_id`。實際上沒有 attach 被執行 | — |
+
+- crosvm `11c5462` 的修正**確實生效**：三次開機共 5 次 `backend attached`、10 次 `waits in PORTSC`，
+  `event ring is uninitialized` 與 `xhci controller stopped working` 各 **0** 次；五次 attach 全部
+  `exiting with success`，daemon 沒有 `no_available_port`／`failed_to_open_device`，也沒有任何介面需要手動
+  `drivers_probe`（上一輪要手動救的情況這輪一次都沒有）。代價是新補的兩條路徑本輪都沒被走到：attach 從沒失敗過，
+  所以「把 crosvm 真正的錯誤帶出來」和 leftover 介面還原都沒有機會驗證（`leftover`／`Recovered` 在 daemon log 各 0 筆）。
+- **guest 端失敗換了一個原因（3/3 必現，跟接幾顆無關）**：裝置在 guest firmware 之前就接上，firmware 的
+  USBCMD.HCRST 讓 crosvm 走 `Xhci::reset()`（只停 slot、重置 hub），接著 firmware 的 CRCR 寫入被
+  `Write to crcr while command ring is running` 打回——CRR 從上電就是 1（`xhci_regs.rs` 的 crcr `reset_value: 9`
+  ＝ RCS|CRR），而 `reset()` 從來不清它，command ring 的 dequeue pointer 因此永遠停在初值 0；firmware 這時看得到
+  已連線的 port，發了命令、敲 doorbell 0，command ring 就從位址 0 讀 TRB，crosvm 噴
+  `removing event handler ... invalid guest address 0x0`，整個 xHCI 事件處理器當場被拆掉——比 guest kernel 起來
+  還早 22–23 秒，所以 xhci_hcd 一探測就是 `HC died`。歷史上每次開機都有同一條被打回的 CRCR 寫入（改版前 13 次），
+  只是那時 firmware 期間沒有任何 port 連線、不會發命令，所以一直無害。→ **crosvm 修正中（HCRST reset）**，
+  細節見 `USB_PASSTHROUGH_SURVEY.md` §9.1。
+- 審核員另外指出：接了裝置之後，firmware 階段（第一次 HCRST 到 kernel 自己那次 HCRST）從歷史的 ~3 秒拉長到 ~23 秒，
+  是 firmware 對著已經死掉的 controller 逾時——F/R 這條路即使不算裝置不見，開機本身也被拖慢。
+- watchdog（13:44:41Z→14:02:47Z，每 5 秒取樣）：`HOST_REBOOT`＝0、host uptime 單調 3911.90 → 4997.66 s、三次
+  vm_start 前都 PRECHECK_OK、F/G 兩次 POSTLAUNCH_OK（served=2423）、沒有 POSTLAUNCH_FAIL 也沒有 kill -9。收尾乾淨：
+  crosvm 0 個、`state=idle pool_avail=3072 served=0 active_vms=0`、規則清空、兩顆裝置自己回到 host 驅動
+  （asound card 1+2、`/dev/video2,3`），全程沒有手動還原過任何驅動。
+
 ### 2.5 事件時序
 | 事件 | daemon 做什麼 |
 |---|---|
