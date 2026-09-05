@@ -1,7 +1,7 @@
 # USB 透傳：Android 端接線計劃（2026-09-04）
 
 > 狀態（2026-09-04 收工）：§2、§3、§5 階段 A/B 與 M5 已完成並實機驗收（見 USB_PASSTHROUGH_SURVEY.md §8）；
-> §4 app 頁面（M3）未做；§2.4 自動規則（M4）2026-09-05 定案、實作中。
+> §4 app 頁面（M3）未做；§2.4 自動規則（M4）2026-09-05 實作完成，實機 9/11 情境通過，VM 開機觸發等 crosvm `11c5462` 重驗。
 
 前提（USB_PASSTHROUGH_SURVEY.md 的結論）：Linux guest 走 protected + restricted-dma-pool，
 Windows guest 走 pseudo-unprotected；兩者 host 端機制相同，差別只在 crosvm 的 gate。本文只講
@@ -138,6 +138,26 @@ for d in 候選:
 **實機驗證（5568 一次只能跑一台 VM，多 VM 順序留給單元測試）**：模擬拔插用 sysfs——`echo 1 > /sys/bus/usb/devices/<dev>/remove`
 移除，再對 hub `echo 1-1.2 > /sys/bus/usb/drivers/usb/unbind && echo 1-1.2 > .../bind` 讓 hub 重新列舉（子裝置以新 devnum
 重新出現，inotify 看到 CREATE，等同重插）；真實拔插由使用者手動補測。
+
+**M4 實作與驗收紀錄（2026-09-05 晚）**
+- 實作：app `b7bdbe0`（規則模型/引擎/持久化、IPC `usb_rules_get/set/test`、console `usb-rules`、`usb_host_list` 多
+  `id/port/held/auto_rule`、事件 `usb_auto_attached/usb_auto_failed`）、`34d8793`（failed_for 在該 VM 下次 RUNNING
+  清除）、`156c603`（UI：設定 → 虛擬機器 → USB 直通，四層可排序清單、從現插裝置/port 新增、留給 host、dry-run 預覽）、
+  `2b14fb6`（RUNNING 觸發先輪詢 control socket 就緒最多 60 s；連線類失敗不記 failed_for、2 s 後重跑最多 3 次）。
+  JVM 測試 49 個（daemon）+ 7 個（UI）。
+- 5568 實機（workflow `usb-m4-rules-verify` + 審核）：A 無規則不接、B 存檔觸發 port 層、C 手動 detach 後 held 存檔不再接、
+  D sysfs 模擬拔插清 held 並觸發接入、E 裝置層第二顆、H 關機 VM 的 port 規則讓給裝置層、I exact 層（錯 port 不接、對
+  port 接）、J 無效規則（any 含 null）被拒且不影響現有、K daemon 重啟後規則仍在（檔案 owner 為 app uid）、UI 頁面/預覽
+  截圖——全部 CONFIRMED。F/G（VM 開機觸發）失敗：**crosvm 的 bug**——VM 剛 RUNNING、guest xHCI 驅動還沒建 event ring
+  就 attach，crosvm 回 `cannot add event: event ring is uninitialized` 並把整個 xHCI 停掉（`xhci controller stopped
+  working`），該 VM 之後 USB 全死，usbfs claim 漏在死掉的 crosvm 裡讓 host 驅動收不回（daemon 等 4×10 s 後回錯誤的
+  `no_available_port`）。真實硬體只是把 CSC 留在 PORTSC 等驅動起來後掃到；修在 crosvm `11c5462`（event ring 未初始化時
+  的 port change 不再是錯誤）。daemon 端另補：VM STOPPED 後對「被迫留著沒綁」的介面再跑一次還原、attach 錯誤帶出 crosvm
+  stderr 的真正原因。
+- 規則語意注意：`any` 層會吃掉所有沒被前三層命中的裝置，包括給 Android 用的滑鼠與掛載中的隨身碟/SSD；驗收時用的
+  fixture 必須先用 `vm: null` 把它們留在 host。**UI 應在新增 any 規則時警告，並列出目前會被吸走的裝置（用 dry-run）。**
+- 手機在驗收中途重啟一次（20:39:59，zygote SIGABRT `selinux_android_setcontext(... vendor.qti.frameworks.utils)`，
+  bootreason=reboot、無 pstore），與 DroidVM 無關、不可重現；watchdog 見 `vmwatch.sh` / `debugloop.md`。
 
 ### 2.5 事件時序
 | 事件 | daemon 做什麼 |
