@@ -493,6 +493,11 @@ xHCI 模型缺陷——不是 isochronous 的問題。**
   MFINDEX 前方約 1024 個 frame；計數器不動，1.024 秒後就排不下去，等到 URB 逾時才重置管線。Linux 的
   snd-usb-audio 不看 MFINDEX（ISO_ASAP 靠主機排程），所以 Linux 沒事。修法（`d2f4b57`）：`register_space`
   加 `set_read_cb`，MFINDEX 讀取回傳自上次 HCRST 起的 125 µs tick 數（14 位元繞回）。實機重驗進行中。
+- Linux 回歸（`4c6d149`，同日）：播放 OK（hw_ptr 45744→94032→142608，≈48000/s，0 xrun）；攝影機 MJPG 640
+  29.98 fps / 720p 29.97 fps、SOI 90/90、YUYV 36864000 B 剛好 60 幀、攝影機 mic 144000 samples 都 OK。AB13X 錄音
+  0 samples——但**同一顆麥克風在 Android host 上直接用 tinycap 也是 0 frames**（開得起來、第一次 read 就失敗，
+  重新列舉也一樣），攝影機 mic 在 host 上 tinycap 正常；hub 沒有 per-port 電源控制，只能實體重插救。判定是
+  裝置本身壞了，不是 crosvm 回歸（9/4 那輪它在 guest 裡是好的）。isochronous IN 的驗證改用攝影機 mic。
 - 未做：USBCMD.EWE 的 MFINDEX Wrap Event（每 2.048 秒一個事件 TRB）；若 Windows 有開 EWE 再補。
 
 **結論：M6「把 isochronous 接線」在 protected Linux（本專案主目標）已達成並實測通過（音效播放/錄音、
