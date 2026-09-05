@@ -546,7 +546,7 @@ xHCI 模型缺陷——不是 isochronous 的問題。**
 
 **HCRST 缺陷（2026-09-05 深夜由 M4 的「VM 開機觸發」測出，`11c5462` 仍在）：HCRST 沒有重置
 command ring／CRCR／interrupter，開機前就接上的裝置會讓整台 xHCI 在 guest kernel 起來之前就死掉——
-已由 crosvm `391518c`（cherry-pick 自 `eb47f50`）修好，裝機驗證中。**
+已由 crosvm `391518c`（cherry-pick 自 `eb47f50`）修好，2026-09-06 凌晨在 5568 上實機驗證通過。**
 - 現象（5568 的 Ubuntu app VM，daemon 的自動接入規則在 `vm_start` 後約 10 秒 attach，也就是 guest firmware
   還沒碰 xHCI 之前；3/3 必現）：`usb_hub: backend attached to port N` ＋ `port N changed before the guest set up
   its event ring; the change waits in PORTSC`，1.2 ms 後 `device_slot: xhci: stopping all device slots and
@@ -595,8 +595,46 @@ command ring／CRCR／interrupter，開機前就接上的裝置會讓整台 xHCI
 - 一併關掉的風險：`11c5462` 的延後 PORTSC 是靠「event ring 尚未初始化」判斷的，但 HCRST 之後 interrupter 還握著
   firmware 那份 event ring；kernel 自己 HCRST 時 hub reset 重貼的 port change 事件會被寫進 firmware 的 ERST
   記憶體——那塊記憶體已經歸 kernel 用了，是一條會默默弄髒 guest 記憶體的路。把 interrupter 一起重置就沒了。
-- 狀態：**已修，裝機驗證中**（APK md5 `1e7f5b95…`，crosvm md5 `b55fcee2…`；§9.3 那輪實機跑的
-  `f8029b85…` 是 `ce5a1d2`，還沒帶這個修正）。
+- 狀態：**已修並驗證（2026-09-06 凌晨，5568；APK `0.0.6.r223.gf893906` md5 `1e7f5b95…`、
+  crosvm md5 `b55fcee2…`＝`391518c`，手動 launcher 用的是同一支 binary；§9.3 那輪跑的 `f8029b85…`
+  是 `ce5a1d2`，還沒帶這個修正）。**
+  - **app 路徑（daemon 自動規則，M4 第三輪；情境表見 `USB_PASSTHROUGH_ANDROID_PLAN.md` §2.4）**：F（VM 開機
+    觸發接兩顆）、R（`vm_reboot` 釋放再接回）、G（`vm: null` 留 host ＋ `any` 收尾）、WF（Windows
+    pseudo-unprotected 開機前就掛規則）四個情境 daemon 端與 guest 端**全部 PASS**——第二輪必死的 guest 端
+    這次 `lsusb` 兩顆都在、`/dev/video0,1`、asound card 1+2，`v4l2-ctl` 抓 30 幀 rc=0、`arecord` 錄到
+    64044 B，dmesg `HC died`＝0。firmware 階段從壞掉時的 ~23 秒回到 **3.28 s（F）／3.30 s（R）／3.01 s（G）**，
+    `Write to crcr`／`invalid guest address`／`removing event handler`／`controller stopped` 全部 0。
+  - WF 是同一件事的 Windows 版（VM 開機時裝置已經掛在 port 上）：`host controller reset`＝2
+    （17:10:42.844 firmware、17:10:47.570 Windows 的 xhci 驅動），`backend attached`＝1、required-zero 全 0、
+    ERROR＝0，Windows PnP 認到攝影機 `ConfigManagerErrorCode`＝0；`vm_stop` 後 +0.36 s 釋放，host 的 1-1.3
+    1 秒內回到 uvcvideo。
+  - **WU1（手動 launcher，Windows pseudo-unprotected ＋ UNITEK UAS）**：PnP 認成
+    `USB Attached SCSI (UAS) Mass Storage Device`（problem=0），`Get-Disk` Disk 1 UNITEK 4 TB
+    Offline／ReadOnly，raw 未緩衝讀 500×1 MiB 兩趟 **347.1 / 361.2 MB/s**；required-zero 計數全 0，而且
+    **`Write to crcr` 的 ERROR 不見了**（run1 的 `f8029b85` 有 1 條）、**一條
+    `stream_N is already stopped` 都沒有**（run1 有 77 條）。
+  - **WU2（「帶著磁碟暖開機」）——先講怎麼跑的**：手動 launcher 下真正的 guest 暖開機測不到，因為
+    `shutdown /r` 會讓 crosvm 程序自己結束（`VmEventType::Reset` → `ExitState::Reset`，
+    `src/crosvm/sys/linux.rs:4650`／`src/main.rs:128` 印 `exiting with reset`，而 `run_windows.sh` 只
+    `exec` crosvm 一次、沒有東西會重啟它），所以 WU2 改用兩種手法在同一個 crosvm pid（11818）上做出同樣的
+    xHCI 條件：(a) 讓 VM **帶著裝置開機**——crosvm 17:32:19 起，UNITEK 在 12 秒後的 17:32:31 就 attach，
+    Windows 的 USBXHCI 是對著一個已經連著裝置的 port 起來的（17:32:32.882 那次 HCRST）；(b) 在磁碟已經跑過
+    全速讀、UAS bulk streams 都配好之後，在 guest 裡用
+    `pnputil /restart-device "PCI\VEN_1B36&DEV_000D…&0&20"`（Standard USB 3.0 eXtensible Host Controller）
+    **重啟 xHCI 兩次**（17:35:00.978、17:36:11.959；這台 Windows 沒有 `Restart-PnpDevice` 這個 cmdlet，
+    所以用 pnputil）。
+  - **WU2 結果**：三次帶著裝置的 HCRST 之後 Windows 每次都重新列舉（`USB\VID_152D&PID_A583` Status=OK
+    problem=0）、Disk 1 仍是 Offline／ReadOnly、沒有多出磁碟區，raw 讀分別是**帶著裝置開機後 294.0 / 301.3
+    MB/s、第一次 HCRST 後 304.6 / 302.5 MB/s、第二次後 300.7 MB/s**。每一次都是
+    `resetting all device slots and the host hub` 接著
+    `port 9 changed before the guest set up its event ring; the change waits in PORTSC`——新的 HCRST 路徑
+    把 port change 留在 PORTSC，而不是丟掉或寫進已經死掉的 event ring。計數 `Resource`＝0、
+    `already has host streams`＝0（代表舊的 host streams 確實被釋放、新的配得出來），其餘 required-zero
+    全 0、ERROR＝0、WARN＝2（都是與 USB 無關的 gunyah 開機提示）。整份 Windows log 共 **5 次
+    `host controller reset`**，第 5 次是 17:43:13.517 關機時 Windows 自己拆掉 xHCI，那時裝置早在 17:37:41
+    detach、上面沒有任何裝置，接著就是 `crosvm exiting with success`。
+  - Linux 這邊同一支 binary 重跑（LU1）：`uas` 綁上、沒有 `UAS is ignored`，log 57 行 ERROR＝0、
+    `is already stopped` 0 條（run1 是 1 條 ERROR ＋ 77 條），吞吐量見 §9.3。
 
 ### 9.2 Windows 重驗（2026-09-05，crosvm `4c6d149` → `d2f4b57`）
 
@@ -729,6 +767,8 @@ Windows 在 attach 前先關 automount（`mountvol /N`，`NoAutoMount` 空→1�
 | Linux pseudo-unprotected | 264 MB/s | 263.8 MB/s | 385.5 MB/s | 1330 IOPS | 9791 IOPS | 95.2%（/800%） |
 | Windows pseudo-unprotected（`f8029b85` 重測） | 274.8 / 322.5 / 332.7 MB/s（raw 未緩衝讀） | 未測 | 未測 | 2530 IOPS（非 fio） | 未測 | 未量 |
 | Linux protected（`f8029b85` 重測，同一種 launcher） | 326 / 344 MB/s | 253 MB/s | 429 MB/s | 1458 IOPS | 6728 IOPS | 未量 |
+| Windows pseudo-unprotected（`b55fcee2`＝`391518c` 重測） | 347.1 / 361.2 MB/s（raw 未緩衝讀）；三次 HCRST 之後 294.0 / 301.3、304.6 / 302.5、300.7 MB/s | 未測 | 未測 | 未測 | 未測 | 未量 |
+| Linux protected（`b55fcee2`＝`391518c` 重測，同一種 launcher） | 315 / 321 MB/s | 240.0 MB/s | 431.6 MB/s | 1325 IOPS | 8398 IOPS | 未量 |
 
 本輪（`11c5462`）Windows 整列量不到：磁碟從頭到尾沒列舉出來（`Get-Disk` 只看得到 VirtIO 系統碟，
 沒有任何 PhysicalDrive），因為 crosvm 的 Configure Endpoint 被 `bad stream context type: 0` 打回、
@@ -764,7 +804,12 @@ binary（`f8029b85` ＝ `ce5a1d2`）重量的，量法跟 Linux 不同：raw 未
   既可能是佇列變深、也可能是外接盒/SSD 自己的快取，證據分不出來。
 - 重測那一列的兩處對不上，都還沒解釋：dd 從 234 升到 326 / 344 MB/s、fio qd1 從 233.9 升到 253 MB/s——
   stream 的修法對 Linux `uas` 不該有這種效果（它本來就每格都填 Linear、走的是同一條路），兩邊都是單次
-  取樣，先當變異度看；反過來 rand4k qd32 從 9099 掉到 6728 IOPS（−26%）也是同一個問題，**待追**。
+  取樣，先當變異度看。
+- **rand4k qd32 那個 −26% 是取樣變異，不是回歸（2026-09-06 凌晨 `b55fcee2` 重測結案）**：同樣的
+  Linux protected ＋ 手動 launcher，qd32 回到 **8398 IOPS**，離 9099 的基準只差 8%（比 `f8029b85` 那輪的
+  6728 高 25%）；同一輪 qd8 的 **431.6 MB/s** 還是三輪裡最高的。反方向的 seq qd1（240.0，−5%）與 rand4k qd1
+  （1325 IOPS，−9%）都是單一在途 IO 的延遲數字，同屬變異；buffered dd 315 / 321 MB/s 也仍在 234 MB/s 基準之上。
+  唯一的量法差異：這輪 fio 每個 job 跑 20 秒（前兩輪 15 秒），所以 qd1 的比較本來就弱一點。
 
 **打死整台 xHCI 的那個 `bad stream context type: 0`（本輪 Windows 量不到東西的原因）：診斷、三個 commit
 的修法、以及修好之後的實機驗收，全部記在 §9.1。**

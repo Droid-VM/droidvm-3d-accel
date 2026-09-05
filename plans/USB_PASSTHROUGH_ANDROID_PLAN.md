@@ -1,7 +1,8 @@
 # USB 透傳：Android 端接線計劃（2026-09-04）
 
 > 狀態（2026-09-04 收工）：§2、§3、§5 階段 A/B 與 M5 已完成並實機驗收（見 USB_PASSTHROUGH_SURVEY.md §8）；
-> §4 app 頁面（M3）未做；§2.4 自動規則（M4）2026-09-05 實作完成，實機 9/11 情境通過，VM 開機觸發等 crosvm `11c5462` 重驗。
+> §4 app 頁面（M3）未做；§2.4 自動規則（M4）2026-09-05 實作完成，2026-09-06 凌晨第三輪（crosvm `391518c`）
+> 連 VM 開機觸發（F/R/G）與 Windows 開機前就掛規則（WF）都在 guest 端驗過，M4 的四個觸發情境全部端到端通過。
 
 前提（USB_PASSTHROUGH_SURVEY.md 的結論）：Linux guest 走 protected + restricted-dma-pool，
 Windows guest 走 pseudo-unprotected；兩者 host 端機制相同，差別只在 crosvm 的 gate。本文只講
@@ -181,14 +182,41 @@ for d in 候選:
   已連線的 port，發了命令、敲 doorbell 0，command ring 就從位址 0 讀 TRB，crosvm 噴
   `removing event handler ... invalid guest address 0x0`，整個 xHCI 事件處理器當場被拆掉——比 guest kernel 起來
   還早 22–23 秒，所以 xhci_hcd 一探測就是 `HC died`。歷史上每次開機都有同一條被打回的 CRCR 寫入（改版前 13 次），
-  只是那時 firmware 期間沒有任何 port 連線、不會發命令，所以一直無害。→ **crosvm 修正中（HCRST reset）**，
-  細節見 `USB_PASSTHROUGH_SURVEY.md` §9.1。
+  只是那時 firmware 期間沒有任何 port 連線、不會發命令，所以一直無害。→ **已由 crosvm `391518c`（HCRST reset）修好，
+  第三輪 F/R/G/WF guest 端全過（見下）**，細節見 `USB_PASSTHROUGH_SURVEY.md` §9.1。
 - 審核員另外指出：接了裝置之後，firmware 階段（第一次 HCRST 到 kernel 自己那次 HCRST）從歷史的 ~3 秒拉長到 ~23 秒，
   是 firmware 對著已經死掉的 controller 逾時——F/R 這條路即使不算裝置不見，開機本身也被拖慢。
 - watchdog（13:44:41Z→14:02:47Z，每 5 秒取樣）：`HOST_REBOOT`＝0、host uptime 單調 3911.90 → 4997.66 s、三次
   vm_start 前都 PRECHECK_OK、F/G 兩次 POSTLAUNCH_OK（served=2423）、沒有 POSTLAUNCH_FAIL 也沒有 kill -9。收尾乾淨：
   crosvm 0 個、`state=idle pool_avail=3072 served=0 active_vms=0`、規則清空、兩顆裝置自己回到 host 驅動
   （asound card 1+2、`/dev/video2,3`），全程沒有手動還原過任何驅動。
+
+**M4 第三輪驗收（2026-09-06 凌晨，APK `0.0.6.r223.gf893906`（檔案 md5 `1e7f5b95…`）＝crosvm `391518c`
+（app 解出的副本 md5 `b55fcee2…`）＋ daemon `f893906`；workflow ＋ 獨立審核）**
+
+| 情境 | daemon 端 | guest 端 |
+|---|---|---|
+| F：VM 開機觸發接入兩顆 | **PASS**。VM 沒跑時存規則 `applied=0`；`state=running` 之後 10.6 s 內 1-1.2.2（`device[0]`）與 1-1.3（`device[1]`）各發一個 `usb_auto_attached`，八個介面全部交給 usbfs | **PASS**。`lsusb` 兩顆都在（`0020:0b21`、`32e6:9221`）、`/dev/video0,1`、asound card 1=AB13X／2=camera；`v4l2-ctl` 抓 30 幀 rc=0（回報 19.99 fps）、`arecord` 從攝影機麥克風錄到 64044 B；dmesg `HC died`＝0、`Abort failed`＝0 |
+| R：`vm_reboot` 釋放再接回 | **PASS**。REBOOTING 就 `usb_vm_changed devices=[]`（+1.20 s），RUNNING 之後 +10.95 s／+11.17 s 兩顆再接入 | **PASS**。`lsusb` 兩顆都回來、`/dev/video0,1`、asound card 1+2；firmware 階段 3.30 s |
+| G：`vm: null` 留 host ＋ `any` 收尾 | **PASS**。規則存檔時 VM 沒跑 `applied=0`；只有攝影機由 `any[0]` 在 +9.54 s 接走，AB13X 一路留在 host 的 snd-usb-audio；`vm_stop` 後 +1.24 s host 驅動自己回來（沒有手動 `drivers_probe`） | **PASS**。guest `lsusb` 只有 `32e6:9221` |
+| WF：Windows app VM 開機前就掛規則 | **PASS**。pseudo-unprotected 的 Windows VM `vm_start` 後 +6.93 s 由 `device[0]` 接走攝影機（AB13X 從沒被碰）；`vm_stop` +0.36 s 釋放、exit_code 0，host `1-1.3` 1 秒內回到 uvcvideo | **PASS**。Windows PnP：VID_32E6 composite／MI_00 Camera／MI_02 MEDIA 全部 OK、`ConfigManagerErrorCode`＝0 |
+
+- crosvm `391518c` 的 HCRST 修正**確實生效，guest 端這次跟著過**：F 的 crosvm 計數 `backend attached`＝2、
+  `waits in PORTSC`＝6，`Write to crcr`／`invalid guest address`／`removing event handler`／`controller stopped`
+  全部 **0**（第二輪就是這四條把 xHCI 打死的）。firmware 階段（第一次 HCRST 到 kernel 自己那次）回到
+  **3.28 s（F）／3.30 s（R）／3.01 s（G）**，對照第二輪壞掉時的 ~23 秒。
+- WF 是「VM 開機時裝置已經掛在 port 上」的 Windows 版：`host controller reset`＝2
+  （17:10:42.844 firmware、17:10:47.570 Windows 的 xhci 驅動，相距 4.73 s），`backend attached`＝1，
+  required-zero 六條全 0、ERROR＝0；`vm_stop` 之後 host 端 1-1.3 的四個介面在 1 秒內回到
+  uvcvideo／uvcvideo／snd-usb-audio／snd-usb-audio。
+- watchdog：本輪所有 monitor log 的 `HOST_REBOOT` 全部＝0、host uptime 單調，收尾乾淨——crosvm 0 個、
+  `state=idle pool_avail=3072 served=0 active_vms=0`、`2-1.1:1.0` 回到 uas、兩個 public volume 都掛回來、
+  攝影機與 AB13X 回到 uvcvideo／snd-usb-audio，daemon `Daemon is running`。
+- 審核員點出的既有雜訊（**不是回歸**）：接兩顆裝置開機時，firmware → kernel 交接處固定有 2 條
+  `ERROR devices::usb::xhci::device_slot] device slot is already enabled`（改版前的 log 是 6 條），
+  修好的 binary 上也還在；另外 `xhci: endpoint is stalled. set state to Halted` 的 WARN（F 6 次、R 5 次、
+  WF 1 次）與 guest 對音效裝置問 clock frequency（`cannot get freq at ep 0x3/0x83`）的 STALL 對得上，
+  判定無害但**沒有真的追到底**。
 
 ### 2.5 事件時序
 | 事件 | daemon 做什麼 |
