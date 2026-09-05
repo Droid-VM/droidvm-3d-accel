@@ -456,10 +456,22 @@ xHCI 模型缺陷——不是 isochronous 的問題。**
   timer 設到窗口結束（一個窗口只 arm 一次），新的 `IntrModerationHandler` 掛在 xHCI event loop 上，timer 到期
   再呼叫一次 `interrupt_if_needed()`。單元測試三個：無 moderation 每事件都中斷；窗口內事件在窗口結束後被送達
   （修正前此測試失敗）；一個窗口內多個事件只 arm 一次。
-- 順帶查到、未修的次要缺陷：CRCR 的 Command Abort/Stop（CA/CS）沒實作，所以 Windows 的 abort 救不回來直接升級
-  成整台 reset；`device_slot::set_tr_dequeue_ptr` 沒套用 TRB 的 DCS 位元（`command_ring_controller` 也沒讀）。
+- **第二層（`be6ad1c` 裝上去重驗後露出，crosvm `453d09d` 修）**：moderation 修好後 controller 不再被 reset
+  （53 條命令全配對、無 watchdog），但 STALL 之後 Windows 送的 Reset Endpoint + Set TR Dequeue（指標
+  `0x17495b400`、DCS=1）crosvm 都回成功，接下來那個控制傳輸卻永遠不執行；Windows 每 7 秒 Stop Endpoint →
+  Set TR Dequeue 同一位址重試，usbaudio 6 次後 FAILED_START，usbvideo 的 DeviceStart 根本回不來。用現有
+  binary 開 `devices::usb::xhci=debug` 重跑一次 attach 就抓到：每次 Set TR Dequeue + doorbell 之後 EP0 ring
+  印 `cycle bit does not match, self cycle false`——crosvm 的 consumer cycle 是 0、Windows 給的 DCS 是 1，
+  ring 把合法 TRB 當成不屬於自己的、回報「空」。兩個規範缺口疊出這個結果：(a) endpoint 進 Halted 後 ring
+  controller 沒停，繼續把 guest 排在失敗 TD 後面的 TD 拿去執行（走過 link TRB 就翻了 cycle）；(b)
+  `set_tr_dequeue_ptr` 只設指標、不套用命令帶的 DCS（spec 6.4.3.9）。Linux 沒踩到是因為它的 Set TR Dequeue
+  總是指到 crosvm 已經走到的位置。修法：`RingBufferController::halt()` 在 `halt_endpoint` 時把 ring 停在
+  Stopped（並釋放等待中的 stop latch）；Set TR Dequeue 把 DCS 套到 ring 與 endpoint context。單元測試：halted
+  ring 不再吐出下一個 TD、doorbell 後從原處續跑。
+- 順帶查到、未修的次要缺陷：CRCR 的 Command Abort/Stop（CA/CS）沒實作，所以命令逾時時 Windows 的 abort 救不回來、
+  直接升級成整台 reset（有了上面兩修正後不應再走到這裡）。
 
 **結論：M6「把 isochronous 接線」在 protected Linux（本專案主目標）已達成並實測通過（音效播放/錄音、
 攝影機 30 fps、攝影機麥克風）。Windows pseudo-unprotected 的 isochronous 被一個獨立的、與 iso 無關的 interrupter
-中斷節流缺陷擋住，已在 `be6ad1c` 修正，實機重驗見 §9.2；USB 基本功能（bulk 三顆）在 Windows pseudo 仍如 §8 驗過可用。**
+中斷節流缺陷擋住，已在 `be6ad1c` + `453d09d` 修正，實機重驗見 §9.2；USB 基本功能（bulk 三顆）在 Windows pseudo 仍如 §8 驗過可用。**
 
