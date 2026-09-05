@@ -539,7 +539,9 @@ xHCI 模型缺陷——不是 isochronous 的問題。**
   - UAS status pipe（stream 端點 ep_7）上，每次 Stop Endpoint 到接下來的 Set TR Dequeue 中間固定卡 **4.0 秒**，
     三次都一樣，每次收尾都是一顆 URB 被取消（`0xC0000120`）——crosvm 對被 Stop Endpoint 取消的 TD 不發
     Stopped 傳輸事件；re-attach 時另外還有一段 12 秒沒有流量。結果是 `disk.sys` 起來要 6 秒（首次）／
-    22 秒（re-attach），每次列舉必現。
+    22 秒（re-attach），每次列舉必現。**（已定位並修好，見本節最後一條「Stop Endpoint 不回報進行中的
+    TD」：ep_7 其實是 UAS 的 data-in 管線、不是 status 管線，crosvm 少的是 xHCI 1.2 4.6.9 要求的 Stopped
+    傳輸事件；crosvm `dc1e0bf`＋`9293b36`＋`13242f9`，裝機驗證中。）**
   - fio rand4k qd32 6728 IOPS 比先前的 9099 低 26%（qd1 反而從 1195 升到 1458），單次取樣，待追。
   - Windows console log 開頭那個 BSOD 0x50 屬於上一輪 FAILED 的強制關機，不是本輪的。
   - 「沒有 Not Valid doorbell」在 info 等級的 log 證不出來（那幾條訊息是 `debug!`）。
@@ -635,6 +637,77 @@ command ring／CRCR／interrupter，開機前就接上的裝置會讓整台 xHCI
     detach、上面沒有任何裝置，接著就是 `crosvm exiting with success`。
   - Linux 這邊同一支 binary 重跑（LU1）：`uas` 綁上、沒有 `UAS is ignored`，log 57 行 ERROR＝0、
     `is already stopped` 0 條（run1 是 1 條 ERROR ＋ 77 條），吞吐量見 §9.3。
+
+**Stop Endpoint 不回報進行中的 TD（沒有 Stopped transfer event），Windows 每次 stop 固定等 2–4 秒——
+已由 crosvm `dc1e0bf` + `9293b36` + `13242f9` 三個 commit 修好，2026-09-06 已編譯，裝機驗證中。**
+- 現象（ETW，scratchpad `m6b/uas/run1` 的 `4W2-etw.txt`、`usbtrace-w*.xml`）：三個週期一模一樣——UAS
+  data-in stream 端點（slot 1 DCI 7）的 Stop Endpoint 在 1 ms 內就拿到 completion code 1，接下來
+  **4.008／4.015／4.000 秒**之內沒有任何 USBXHCI／UCX／USBHUB3 事件，等滿了才是 Set TR Dequeue，
+  收尾都是一顆 URB 以 `0xC0000120`（STATUS_CANCELLED）完成。同一種等待在別的端點型態上是 **2.0 秒**，
+  每一次 Stop Endpoint 都付：windows3 的音效 ISO DCI 6（02:32:29.432 → 02:32:31.440，同一輪另有三次）、
+  windows4 的音效 DCI 7（07:16:31.839 → 07:16:33.855）、windows5 的攝影機 interrupt DCI 3
+  （08:55:22.685 → 08:55:24.688）與攝影機 ISO DCI 11（08:58:56.333 → 08:58:58.350）。`disk.sys` 起來
+  因此是 6.0 秒（首次）／22.0 秒（re-attach），22 秒那次中間還有一段 **12 秒完全沒有流量**：一顆其實
+  已經完成的 TD 被回報成「什麼都沒有」，Windows 當它沒跑過、重新排上 ring，crosvm 就對裝置早就答完的
+  命令再送一顆 bulk IN，一直卡到 UASPStor 的請求計時器逾時發 ABORT TASK。
+- 根因：crosvm 的 Stop Endpoint 把該端點（所有 stream）在飛的 URB 全部 DISCARDURB 掉，reap 回來不管
+  什麼狀態一律當成 Cancelled、只叫醒 ring，**不發任何 Transfer Event**；寫回 Endpoint／Stream Context 的
+  TR Dequeue Pointer 又是 `trc.stop()` **之前**讀的，那時 ring 早就走過整顆 TD，指標落在下一顆 TD 上。
+  xHCI 1.2 4.6.9 要求 xHC 對「進行中的那顆 TD」發一個 Stopped／Stopped - Length Invalid／Stopped -
+  Short Packet 的 Transfer Event，而且要排在 Stop Endpoint 的 Command Completion **之前**，指標寫的是
+  那顆 TRB 本身；Windows 的 USBXHCI 等的就是這個事件，等不到就靠 watchdog 收尾（bulk／interrupt／
+  isochronous 2 秒、stream 端點 4 秒），自己把 URB 判成 STATUS_CANCELLED、自己重指 ring。順帶更正上面
+  那條待追的說法：**DCI 7（ep_7）是 UAS 的 data-in 管線，不是 status 管線**——DCI 5 的 5149 筆全是
+  1024 B 的 Sense IU、DCI 2 的 5147 筆全是 32 B 的 Command IU，DCI 7 走的是 524288 B 的讀與 INQUIRY／
+  READ CAPACITY／MODE SENSE 的資料。
+- 修法一（`dc1e0bf`）：**搶在 cancel 之前完成的傳輸要保住它的完成。** DISCARDURB 打到已經完成的 URB 會
+  拿到 EINVAL，那顆 URB 是帶著真實狀態與資料被 reap 回來的；`update_transfer_state` 改成只有 kernel 真的
+  解掉（-ENOENT）才算 Cancelled，其他狀態一律 Completed、走原本的 Success／Short Packet／Stall／NoDevice
+  路徑並帶 `actual_length`。Cancelled 這條也改成拿到真正搬過的位元組數（IN 方向先把資料抄進 guest
+  buffer），後面那個 Stopped 事件才報得出正確的 residual。光這一條就把那 12 秒拿掉。
+- 修法二（`9293b36`）：**Stop Endpoint 回報進行中的 TD，並把 ring 留在它身上。** 被 cancel 的 TD 由
+  `XhciTransferManager` 記下「第一顆沒有整顆搬完的 data TRB」（就是進行中的那顆）、它的 residual
+  （6.4.2.1）、TD 的第一顆 TRB 與那顆 TRB 的 cycle bit；發 Stopped(26)，沒有帶資料的 TRB（只有 Event
+  Data／No-op）就發新加的 Stopped - Length Invalid(27)、長度 0，一律 ED=0 指向 transfer TRB
+  （4.11.5.2）。新的 `TransferDescriptorHandler::finish_stop` 由 `RingBufferController::on_event` 的
+  Stopping 分支在**狀態轉 Stopped、stop callback 釋放之前**呼叫，發事件並把 ring 的 dequeue pointer／
+  consumer cycle 倒回那顆 TRB——Command Completion 就是 stop callback 最後一份被 drop 的時候，事件因此
+  自然排在完成之前。Endpoint／Stream Context 的指標與 DCS 改由 stop callback 的 closure 寫（它看到的是
+  倒回後的 ring），握著那顆 TD 的 stream 另外寫 Stopped EDTLA（6.2.4.1），其餘各格維持 guest 原本的值。
+  dequeue_all（isochronous）的 ring 只對最早那顆沒完成的 TD 發一個 Stopped、倒回它，排在後面已經交出去的
+  TD 就留在 ring 上；stream 端點則是每條有 TD 在飛的 stream 各一個。halt 與 Reset Endpoint 不倒回也不發
+  Stopped（StallError 早就送過了）。
+- 修法三（`13242f9`，兩份獨立審查的收尾）：(a) **must-fix**——stop 期間 reap 到 -ENODEV 會卡死整條
+  command ring（NoDevice 分支 detach 完就 return、沒有叫醒 ring，Stopping 的 ring 永遠不 park，
+  Stop Endpoint 的完成與排在後面的每一顆命令都出不去，連斷線的 Disable Slot 也是），改成 detach 之前
+  先送出 transfer completion event；(b) `stop()` 的同步 park 分支也要跑 finish_stop（與 Stopping 分支
+  共用 `finish_stop_and_park`），否則 reap 搶先跑完那次 stop 就既沒事件也沒倒回；(c) 已經在 Stopping 的
+  ring 再被 stop 一次改成「併入正在進行的那次」，不再重發 cancel（重發的第一件事就是把記錄清掉）；
+  (d) Set TR Dequeue 會清掉舊的 stopped 記錄（軟體移動 ring 就代表那個位置作廢，否則下一次 stop 會拿
+  陳舊的 EDTLA 蓋掉 guest 的值）；(e) EDTLA 的走訪不再把 SetupStage 當成帶資料的 TRB（4.11.5.2）；
+  (f) `update_transfer_state` 的狀態檢查補回來（只接受 Cancelling／Submitted，其餘回
+  BadXhciTransferState）。
+- 測試：host 單元測試 **66 個全過**（`391518c` 是 51、`dc1e0bf` 52、`9293b36` 62），clippy 回到
+  `391518c` 的 39 個 warning 基準。新加的是 `a_transfer_reaped_complete_after_its_cancel_is_completed`
+  （backend/utils）、`cancelled_td_reports_stopped_at_the_trb_in_progress`／
+  `a_cancelled_td_without_data_trbs_is_stopped_length_invalid`／
+  `the_earliest_cancelled_transfer_is_the_one_the_ring_stops_at`（xhci_transfer）、
+  `stop_with_a_transfer_in_flight_rewinds_to_it_and_reports_before_the_callback`（順序向量必須是
+  `["stopped", "callback"]`）／`stop_of_a_drained_ring_rewinds_to_the_earliest_unfinished_descriptor`／
+  `halt_does_not_rewind`（ring_buffer_controller）、
+  `finish_stop_reports_the_earliest_cancelled_descriptor_and_leaves_the_ring_at_it`
+  （transfer_ring_controller）、`stop_endpoint_writes_the_context_from_the_ring_the_callback_sees`／
+  `stop_endpoint_without_streams_writes_the_ring_position_at_the_completion`／
+  `stream_context_write_back_sets_the_stopped_edtla_of_a_stopped_stream_only`（device_slot），以及
+  `13242f9` 的 `a_no_device_completion_still_signals_the_ring`／
+  `stop_that_finds_the_ring_already_quiet_still_reports_the_stopped_descriptor`／
+  `a_second_stop_while_stopping_does_not_cancel_again`／`moving_the_ring_clears_the_stopped_record`。
+  in-tree 沒有假的 `XhciBackendDevice`（只有 host 與 fido 兩個後端），所以「Stopped 真的排在 Command
+  Completion 之前」這一條只能靠實機驗。
+- 狀態：**已編譯（crosvm md5 `9ccc9856…`＝`13242f9`），裝機驗證中**——預期 Stop Endpoint 到 Set TR
+  Dequeue 的間隔從 2–4 秒降到毫秒級、`WatchdogTriggered` 消失、`disk.sys` 的 6 秒／22 秒一起收斂；
+  音效與攝影機那些 isochronous／interrupt 路徑每次 stop 的 2.0 秒也會跟著沒掉，那是改動影響最大的地方，
+  要一併重跑。
 
 ### 9.2 Windows 重驗（2026-09-05，crosvm `4c6d149` → `d2f4b57`）
 
