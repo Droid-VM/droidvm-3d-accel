@@ -529,6 +529,10 @@ xHCI 模型缺陷——不是 isochronous 的問題。**
   - 最終 APK（md5 8b521e9…，crosvm 7a371d1…）安裝成功；Ubuntu app 路徑攝影機 30.00 fps、mic 48000、IPC detach
     後 12 秒內 host 驅動自己回來。Windows app 路徑當輪沒跑成（設定又回 protected，見下一條），另跑
     `usb-m6-app-windows-final`。
+- **Windows app 路徑最終驗收（`usb-m6-app-windows-final`，crosvm `76ed342` 由 app 自己解出）：** pseudo 正常開機
+  （無 WinRE）；IPC usb_attach 音訊、閒置 45 s 後第一次 PlaySync 6892 ms 一次成功；攝影機閒置 45 s 後第一次拍照
+  45759 B / 錄影 19157 B（178 幀）一次成功；攝影機 mic 707438 B 一次成功；detach 後 host 驅動 0 秒內自己回來；
+  攝影機掛著 vm_stop → 3 秒內釋放；本輪 crosvm log `failed to cancel` = 0；手機乾淨。審核員逐項 CONFIRMED。
 - **app 端發現：daemon 的 `vm_modify` 不落地。** `VMInstanceStore.modifyVM()` 只換掉記憶體裡的 instance，
   `files/vms.json`（app uid 擁有）只有 UI 會寫；所以 M5 時把 Windows VM 改成 pseudo_unprotected 只活在舊 daemon
   記憶體裡，daemon 一重啟（裝 APK 必經）就回到 protected_without_firmware，Windows 直接 BSOD 0x7B。這次改用
@@ -545,6 +549,7 @@ xHCI 模型缺陷——不是 isochronous 的問題。**
 - 未做：USBCMD.EWE 的 MFINDEX Wrap Event（每 2.048 秒一個事件 TRB）；若 Windows 有開 EWE 再補。
 
 **結論：M6「把 isochronous 接線」在 protected Linux（本專案主目標）已達成並實測通過（音效播放/錄音、
-攝影機 30 fps、攝影機麥克風）。Windows pseudo-unprotected 的 isochronous 被一個獨立的、與 iso 無關的 interrupter
-中斷節流缺陷擋住，已在 `be6ad1c` + `453d09d` 修正，實機重驗見 §9.2；USB 基本功能（bulk 三顆）在 Windows pseudo 仍如 §8 驗過可用。**
+攝影機 30 fps、攝影機麥克風）。Windows pseudo-unprotected 起初被四層與 iso 無關的 xHCI 模型缺陷擋住（中斷節流丟中斷、halted ring 續跑 + DCS、
+控制傳輸狀態機、MFINDEX 不動）加一個 resume 缺陷，全部在 `be6ad1c`…`76ed342` 修掉；最終在兩種 guest、手動 launcher 與
+app daemon 路徑上，USB 音訊播放、UVC 攝影機影像、攝影機麥克風錄音都實測通過並經獨立審核（§9.2）。**
 
