@@ -498,6 +498,25 @@ xHCI 模型缺陷——不是 isochronous 的問題。**
   0 samples——但**同一顆麥克風在 Android host 上直接用 tinycap 也是 0 frames**（開得起來、第一次 read 就失敗，
   重新列舉也一樣），攝影機 mic 在 host 上 tinycap 正常；hub 沒有 per-port 電源控制，只能實體重插救。判定是
   裝置本身壞了，不是 crosvm 回歸（9/4 那輪它在 guest 裡是好的）。isochronous IN 的驗證改用攝影機 mic。
+- **`d2f4b57` 全套重驗（2026-09-05 下午，workflow `usb-m6-final-verify`，另有獨立審核員重解 ETW/重讀原始檔）：**
+  - Windows（pseudo，手動 launcher）：播放 PlaySync ×3 = 5281 ms（ssh）/ 5279 ms（console session），ETW EP6
+    兩段播放各是**一段不中斷的 burst**（5.137 s/507 URB、7.324 s/709 URB，最大內部間隔 85/142 ms）；攝影機拍照
+    50162 B JPEG 1920×1080、錄影 31821 B H.264 640×480 86 幀（MediaCapture VGA profile 實際 15 fps，是編碼器不是
+    傳輸）；攝影機 mic 錄音 889130 B（EP11 每 10 ms 一個 URB、508 URB/5.03 s、間隔 ≤ 13 ms）；ETW anomalies=0；
+    host log iso 計數全 0；detach 後 host 驅動收回、關機乾淨、pool 3072。
+  - Linux（protected，手動 launcher）：播放 hw_ptr 45456→94032→142320；攝影機 MJPG 640 29.95 fps、SOI 90/90；
+    YUYV 18432000 B 剛好 30 幀；攝影機 mic 48000 samples（RMS 0.0034）。
+  - App 路徑：新 APK（f1a8c1ee…）安裝成功、app 解出的 crosvm 由 73d635e2 → 78508ec1（d2f4b57）；Ubuntu app VM
+    透過 daemon `droidvm usb-attach` 攝影機 30.00 fps、SOI 90/90、mic 48000 samples；IPC usb_detach 後 host 驅動
+    **自己**回來；音訊播放 hw_ptr 44880→93168→141744；裝置掛著 vm_stop → 5 秒內自動釋放回 host。
+  - Windows app VM 第一次沒開起來：它的 VM 設定不知何時回到 `protected_without_firmware`（BSOD 0x7B），用
+    `vm_modify` 改回 `pseudo_unprotected` 後另行重驗（見下）。
+- **審核員抓到的真問題（`7b6a79c` 修）：Windows selective suspend 喚醒後第一次開啟裝置必失敗。** ETW：閒置 ~14 s
+  後裝置 D3、hub D0 Exit；喚醒時 hub 讀 port 1 = `0x507`（suspended），對 port 做 resume 後**等 500 ms 的
+  Port Link State Change 事件**——crosvm 的 `portsc_callback` 只把 PLS 寫進去、從不設 PLC、不發 port status change
+  → USBHUB3 判定裝置消失（Surprise Removal）→ reset port 重新列舉（所以 host log 每次喚醒都有一組 stall/already
+  stopped）→ 第二次開啟才成功。Linux 是輪詢 PLS 所以沒事。修法：LWS 寫入把已連線的 port 從 U3/Resume 帶回 U0
+  時，設 PLC（bit 22）並送 Port Status Change Event（spec 4.15.2.2）。
 - 未做：USBCMD.EWE 的 MFINDEX Wrap Event（每 2.048 秒一個事件 TRB）；若 Windows 有開 EWE 再補。
 
 **結論：M6「把 isochronous 接線」在 protected Linux（本專案主目標）已達成並實測通過（音效播放/錄音、
