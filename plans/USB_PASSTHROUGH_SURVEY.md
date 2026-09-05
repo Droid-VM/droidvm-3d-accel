@@ -410,4 +410,46 @@ set_dequeue_all`；device_slot 對 endpoint context type 1/5 啟用）。兩路�
   整個 port；改成掉一幀。
 驗證裝置（5568）：AB13X USB Audio `0020:0b21`（FS，iface1 alt1 EP 0x03 Isoc OUT 384 B、iface2 alt1
 EP 0x83 Isoc IN 208 B、bInterval 1）與 icSpring 攝影機 `32e6:9221`（HS，iface1 alt1～6 EP 0x82 Isoc IN
-1024×3 → 512×1 B/µframe、iface3 alt1 EP 0x85 Isoc IN 40 B 麥克風）。實機驗證進行中。
+1024×3 → 512×1 B/µframe、iface3 alt1 EP 0x85 Isoc IN 40 B 麥克風）。
+
+### 9.1 驗收結果（2026-09-05，5568，crosvm `b0a47ea`）
+
+**Linux（protected-without-firmware，`--swiotlb 256`）：isochronous 完全通過，音效與攝影機兩路都是實跑實測。**
+- USB 音效 `0020:0b21`：guest 認到 `card 0 AB13X USB Audio`（full speed）。`speaker-test -c2 -r48000`
+  rc=0，pcm status 兩秒間 hw_ptr 前進 48864 frames ≈ 48.9 kHz（就是標稱值），48000/2ch 一次成功、沒退
+  44100/mono；`arecord -r44100 -c1 -d5` rc=0，檔案 441044 B，sox 讀到剛好 220500 samples = 5.000 s。
+  guest kernel log 整段 audio 零 xrun/underrun/EPROTO。
+- UVC 攝影機 `32e6:9221`：`--list-formats-ext` 完整保留 host 的 MJPG/YUYV 清單。640×480 MJPG 手動短曝光
+  29.98 fps、720p 29.95 fps、1080p 29.84 fps，SOI 標記逐幀對得上（90/90、60/60），ffmpeg 抽幀都成功；
+  YUYV 640×480 手動曝光 60 幀 = 36864000 B 剛好 60×614400（逐幀零截斷，18.4 MB/s 持續 iso IN）。第一輪
+  ~16 fps 是相機自身在暗場拉長曝光，非傳輸問題（改手動曝光即回 30 fps）。攝影機自帶的 UAC 麥克風
+  （iface3 EP 0x85 Isoc IN）也認成 `card 0 icspring camera`，`arecord -r48000` 讀到剛好 144000 samples = 3.000 s。
+- host log 整段：`backend rejected transfer`＝0、`dropping the frame`＝0、`cannot build isochronous`＝0。
+  唯一雜訊是串流停止時 crosvm 對 kernel 已完成的 URB 發 DISCARDURB（ioctl 0x550b）拿到 EINVAL（無害）。
+  detach 後 guest 5 秒內聲卡/影像節點全消失，host 端 drivers_probe 收回。
+
+**Windows（pseudo-unprotected）：isochronous 傳輸層沒被測到就先卡住，卡在一個「控制端點失速回復」的
+xHCI 模型缺陷——不是 isochronous 的問題。**
+- 現象：attach 音效後 guest PnP 認到 AB13X（MEDIA class），但音效節點起不來，落到 `CM_PROB_FAILED_START`
+  （code 10，ProblemStatus `0xC0000120` = STATUS_CANCELLED），`waveOutGetNumDevs=0`。整段 host log 只有
+  `slot_1 ep_1`（控制端點）活動，isoch ring（ep_3/ep_5）從未開啟。
+- 根因（ETW：USBXHCI+USBHUB3+UCX+Kernel-PnP，`logman` 抓、`tracerpt` 解，evidence 在 scratchpad
+  `m6-windows-rerun/usbtrace-audio.xml`）：列舉/設定過程中控制端點被 device STALL 一次（很常見，音效裝置對
+  不支援的 class request 回 STALL），Windows 依規範送一對命令回復——**Reset Endpoint（slot 1 DCI 1，crosvm
+  回 code 1 成功）＋ Set TR Dequeue Pointer（slot 1 DCI 1，新 dequeue ptr `0x177ebb800`，DCS=1）**。crosvm
+  的 command ring **對這顆 Set TR Dequeue Pointer 從未送出 Command Completion Event**。3 秒後 Windows 的
+  command-ring watchdog 觸發（Kernel-PnP 902），5 秒後嘗試 abort（host log `Write to crcr while command ring
+  is running`），再 5 秒 abort 逾時，最後整台 controller internal reset、slot/endpoint 全刪，裝置 FAILED_START。
+- 判定：這是 crosvm xHCI 模型的通用缺陷，任何在列舉期 STALL 控制端點的 Windows 裝置都會踩到（bulk 隨身碟/
+  CCID/NIC 之前沒踩到，是因為它們的控制端點在列舉期不 STALL）。Linux 同一顆裝置同一 crosvm 也會 STALL 控制
+  端點三次（host log 有 3 條 `endpoint is stalled`），但 Linux 的回復序列在 crosvm 上完成、音效正常——差別在
+  Windows 送的回復命令組合觸發了 crosvm command ring 漏發完成事件。Set TR Dequeue 這條路
+  （`command_ring_controller.rs::set_tr_dequeue_ptr` → `device_slot.rs::set_tr_dequeue_ptr`）純程式推理看起來
+  每條分支都會呼叫 `command_completion_callback`，實機卻沒送出；要用加日誌的 debug build 才能定位確切分支
+  （另一個已知的旁證：`device_slot::set_tr_dequeue_ptr` 只寫 dequeue pointer、沒套用 TRB 帶的 DCS bit，
+  `command_ring_controller` 也沒讀 DCS，等於忽略 dequeue cycle state；但那會影響之後的傳輸、不會讓命令本身漏回）。
+
+**結論：M6「把 isochronous 接線」在 protected Linux（本專案主目標）已達成並實測通過（音效播放/錄音、
+攝影機 30 fps、攝影機麥克風）。Windows pseudo-unprotected 的 isochronous 被一個獨立的、與 iso 無關的控制端點
+失速回復缺陷擋住，需要單獨修 crosvm command ring；USB 基本功能（bulk 三顆）在 Windows pseudo 仍如 §8 驗過可用。**
+
