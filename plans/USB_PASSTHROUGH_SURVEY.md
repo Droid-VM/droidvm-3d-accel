@@ -646,8 +646,9 @@ command ring／CRCR／interrupter，開機前就接上的裝置會讓整台 xHCI
     `is already stopped` 0 條（run1 是 1 條 ERROR ＋ 77 條），吞吐量見 §9.3。
 
 **Stop Endpoint 不回報進行中的 TD（沒有 Stopped transfer event），Windows 每次 stop 固定等 2–4 秒——
-已由 crosvm `dc1e0bf` + `9293b36` + `13242f9` 三個 commit 修好；2026-09-06 實機驗證：Windows 每次 stop 的
-4 秒／2 秒收斂到 1 ms，Linux 另外掉出一個 isochronous 的 Stopped 事件回歸（修正中）。**
+已由 crosvm `dc1e0bf` + `9293b36` + `13242f9` + `e5eece2` 四個 commit 修好：Windows 每次 stop 的 4 秒／
+2 秒收斂到 5 ms 以內、Linux 的 isochronous 回歸歸零，2026-09-06（run4）Windows／Linux／app 三條路徑
+都實機驗過；只剩 stream 端點「一次 stop 發了不只一個 Stopped 事件」這個新缺陷待修。**
 - 現象（ETW，scratchpad `m6b/uas/run1` 的 `4W2-etw.txt`、`usbtrace-w*.xml`）：三個週期一模一樣——UAS
   data-in stream 端點（slot 1 DCI 7）的 Stop Endpoint 在 1 ms 內就拿到 completion code 1，接下來
   **4.008／4.015／4.000 秒**之內沒有任何 USBXHCI／UCX／USBHUB3 事件，等滿了才是 Set TR Dequeue，
@@ -748,18 +749,64 @@ command ring／CRCR／interrupter，開機前就接上的裝置會讓整台 xHCI
   **不是回歸**：run2 那組數字今天在產生它的那支 binary 上也重現不出來（機身 33–36 °C，不是熱節流）。
   `failed to cancel` **0 條**（修好之前的 linux2 那輪是 62 條）。log 裡剩下的 3 條 ERROR 全是
   `device slot is already enabled`，在 `b55fcee` 上 attach 第 2／第 3 顆裝置照樣一模一樣重現，是既有問題。
-- **新回歸（Linux，本輪抓到）：drain 過的 isochronous ring 對每一顆被 cancel 的 TD 都發一個 Stopped 事件，
-  不是只發進行中的那一顆。** guest 印了 **119** 條 `xhci_hcd ... Event dma <X> for ep 4 status 13 not part
-  of TD at <Y> - <Y>`（`ep 4` ＝ ep_index 4 ＝ DCI 5 ＝ UVC 的 isochronous video IN；status 13 ＝
-  `COMP_STOPPED`），同一份工作量在 `b55fcee` 上是 **0** 條。分成 6 陣、每次串流停止一陣、每陣 2–32 條；
-  guest 等的那顆 TD 只有一顆 TRB，而每一條事件都指向它前面、彼此互不相同的 TRB——整個 drain 過的視窗
-  都被回報成 Stopped，與修法二自己寫下的不變量（`xhci_transfer.rs`：「只有它會被回報 Stopped」、
-  「一次只報最早那一顆」）相牴觸。本輪的影響是良性的（6 次擷取全部 rc=0、沒有 uvc frame error），但有一個
-  **可能的副作用**：6 次擷取有 3 次只跑到 ~15 fps（15.03／15.00／15.00），`b55fcee` 對照組是
-  19.00／19.47／19.44，另外 3 次是 19.70／19.68／20.00——現有證據還不足以排除 iso 串流的 fps 回歸。
-  狀態：**修正中（`DESIGN-STOPPED-ISO.md`）**。另外要記住：**Windows 這一輪從頭到尾沒停過 UVC 的
-  isochronous video IN 端點**（WS3b 停的是音效 iso OUT 與攝影機 interrupt IN），所以這個缺陷在 Windows 上
-  的影響是沒量到的，修好之後的重驗一定要把它補上。
+- **run3 掉出的 isochronous 回歸（已由 `e5eece2` 修好）：drain 過的 ring 停下來時，把「搶在 cancel 之前
+  落地」的每一顆 TD 都當成正常完成回報。** guest 印了 **119** 條 `xhci_hcd ... Event dma <X> for ep 4
+  status 13 not part of TD at <Y> - <Y>`（`ep 4` ＝ ep_index 4 ＝ DCI 5 ＝ UVC 的 isochronous video IN），
+  分成 6 陣、每次串流停止一陣。**先更正上一版的判讀：status 13 是 `COMP_SHORT_PACKET`，不是
+  `COMP_STOPPED`（26）**——這一條正好證明那 119 條不可能來自 Stopped 的發送路徑（`finish_stop` 一次 stop
+  最多發一個，6 次 stop 最多 6 個，crosvm 那邊本來就是一次一個），只能來自 `dc1e0bf`「搶在 cancel 之前
+  完成的傳輸要保住它的完成」那條規則：dequeue_all 的 ring 一次交給後端上百顆（最多 256 顆）單 packet 的
+  isochronous URB，而 isochronous URB 是服務週期一到就完成，不管 guest 還要不要那一幀，所以 Stop Endpoint
+  的 `USBDEVFS_DISCARDURB` 多半打在已經落地的 URB 上（usbfs 回 EINVAL，URB 帶著真實狀態 0 被 reap 回來），
+  `update_transfer_state` 於是把每一顆都轉成 Completed、各發一個普通的 Short Packet Transfer Event——而
+  guest 早就把這些 TD 全部 unlink 掉了，每一條事件都落在它還在等的那顆 TD 前面。
+- 修法四（`e5eece2`）：**drain 過（`dequeue_all`）的 ring 上，被 cancel 的傳輸不管 reap 回什麼狀態
+  （NoDevice 除外）都併進那唯一一個 Stopped 事件。** `update_transfer_state` 多一條帶閘門的分支：ring 是
+  drained-ahead 時，(任何狀態, Cancelling) → Cancelled，照原本那條安靜的 `record_stopped` 路走，ring park
+  之後由 `finish_stop` 對最早那顆發唯一一個 Stopped／Stopped - Length Invalid 並倒回它；裝置真的搬過的
+  位元組仍然靠 Cancelled 分支的 buffer 複製與事件的 residual 送進 guest。NoDevice 留在自己的分支，裝置
+  中途被拔掉時 port 照樣 detach。閘門是新拉的一條線：`RingBufferController::set_dequeue_all` →
+  `TransferDescriptorHandler::set_drained_ahead`（預設 no-op）→ `XhciTransferManager` 的旗標 →
+  `XhciTransfer::on_drained_ahead_ring()`；沒有 dequeue_all 的 ring（bulk／interrupt／control／stream）
+  一個 bit 都沒動。host 單元測試 **69 個全過**（`13242f9` 的 66 ＋ 3，含審查回合補的那個把
+  `set_dequeue_all` 從 controller 一路走到 transfer manager 的鏈路測試——把中間那個轉呼叫拿掉就會紅）。
+  審查接受的一條偏離：drain 過的 ring 上，一顆在 cancel 送出之後才完成的 TD 不再保有自己的完成事件，
+  而是併進那個 Stopped（搬過的量走 residual）——guest 本來就已經 unlink 它了，那 119 條警告就是這些
+  完成事件本身。
+- **2026-09-06 驗收（run4，5568，crosvm `e5eece2` md5 `9f5365c2…`，證據在 scratchpad `m6b/uas/run4`）：
+  Linux A／B 直接歸零、Windows 每次 stop 都在 5 ms 以內、app 路徑同樣乾淨。**
+  - Linux（手動 launcher，同一份工作量腳本、同一個十分鐘窗口內跑兩趟）：新 binary 6 次攝影機串流停止
+    **0 條** `not part of TD`；把前一支 `13242f9`（md5 `9ccc985…`）裝回去跑同一份工作量得到 **131 條**
+    （6 陣、每次 stop 一陣），治具照樣重現得出來，那個 0 是真的不是漏跑。fps 兩支一模一樣（v4l2 回報的
+    **15.0**）；run3 那組 19–20 fps 今天在哪一支 binary 上都沒重現，因此不歸給任何一支。其餘照舊：攝影機
+    自帶 mic `arecord` **192044 B**、`speaker-test` rc=0、UAS dd **234／229 MB/s**。
+  - Windows（pseudo-unprotected，ETW；27 次 Stop Endpoint 由第三方稽核用自己的 TRB 解碼器從原始 timeline
+    重算，加上 app 那一輪的 1 次共 28 次，每一次的 completion 與 Set TR Dequeue 間隔相同）：
+
+| 情境（端點） | 次數 | → Command Completion／Set TR Dequeue |
+|---|---|---|
+| 攝影機 interrupt IN（slot 1 ep_3；正常停止／殺行程／殺 Frame Server／PnP disable） | 10 | 0–5 ms |
+| 音效 isochronous OUT（slot 2 ep_6；含 kill audiodg 真正打斷 drain 過的 ring 的 6 顆 URB 中止） | 6 | 1–2 ms |
+| UAS stream 端點（slot 1 ep_7，10 個 attach／detach 週期） | 11 | 0–1 ms |
+| app 那一輪的 Windows VM（slot 1 ep_3） | 1 | 0 ms |
+
+  - `Kernel-PnP 902 WatchdogTriggered` 這一輪 **1 次**，就是下一條的 stream 缺陷。**攝影機的 VIDEO
+    isochronous IN 端點在 Windows 上從頭到尾收不到 Stop Endpoint**：四條收尾路徑（正常停止、殺掉錄影
+    行程、殺掉 Frame Server、錄影中途 PnP disable）都試過，Windows 一律讓那條 ring 自己 drain 完再用
+    Configure Endpoint alt=0 拆掉，所以這條路徑只能在 Linux 上驗（上面 A／B 驗的就是它）。
+  - App 路徑（APK md5 `39a9d2f9…`，裡面的 crosvm 就是 `9f5365c…`，裝在 5568）：Ubuntu VM-start trigger
+    在 `running` 之後 **9.3／9.5 秒**把兩顆裝置接上，guest 攝影機 3×60 幀、`not part of TD` **0 條**、
+    mic **64044 B**、`speaker-test` rc=0，`vm_stop` 時歸還；Windows app VM 預先接上攝影機：PnP 全 OK、
+    拍照 **182153 B**、錄影 **931222 B**，那一輪唯一的一次 Stop Endpoint 是 **0 ms**。當天 watchdog
+    `HOST_REBOOT` **0**、OTG 掉線 **0**。
+- **新缺陷（Windows，run4 抓到；待修，設計 `DESIGN-STOPPED-STREAMS.md`）：stream 端點的一次 Stop Endpoint
+  不能每條 stream ring 各發一個 Stopped 事件。** UAS 冷接上那次，第一個 Stop Endpoint 時有 **兩條 stream**
+  各有一顆 TD 在飛，crosvm 依修法二當初寫下的規則對每一條 stream ring 各發了一個 Stopped；Windows USBXHCI
+  在同一毫秒記下 event 30 `Received duplicate Stopped Transfer Events`（`HWVerifierFlag=0x2000000`），
+  stream 3 那顆 URB 就被晾了 **16.28 秒**，`disk.sys` 的 DeviceStart 拖到 **18.77 秒**（同一輪後面九個週期
+  都只有一條 stream 在飛，全是 0–1 ms）。規範是：有 stream 的端點只有一條 current stream，一次 Stop
+  Endpoint 只發**一個** Stopped 事件。修法（進行中）：一次 stop 在所有 stream ring 之間只發一個事件，
+  其餘的 ring 照樣默默倒回。
 - Watchdog／收尾：兩支 monitor（Windows 段 18:28–18:58、Linux 段 19:03–19:32）`HOST_REBOOT` 都是 **0**、
   host uptime 單調上升；每次 launch 前 `PRECHECK_OK`、launch 後 `POSTLAUNCH_OK served=2048`；每個 guest
   都是從裡面關機、crosvm 自己在 10 秒內退出（沒有 `crosvm stop`、沒有 kill），pool 收回 **3072**、
