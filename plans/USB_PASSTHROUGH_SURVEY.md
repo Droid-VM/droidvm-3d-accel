@@ -471,8 +471,82 @@ xHCI 模型缺陷——不是 isochronous 的問題。**
 - 順帶查到、未修的次要缺陷：CRCR 的 Command Abort/Stop（CA/CS）沒實作，所以命令逾時時 Windows 的 abort 救不回來、
   直接升級成整台 reset（有了上面兩修正後不應再走到這裡）。
 
-**新缺陷（2026-09-05 深夜由 M4 的「VM 開機觸發」測出，crosvm `11c5462` 仍在，修正中）：HCRST 沒有重置
-command ring／CRCR／interrupter，開機前就接上的裝置會讓整台 xHCI 在 guest kernel 起來之前就死掉。**
+**§9.3 量吞吐量時測出的 UAS streams 缺陷（當時的 `11c5462` 上必現）：已由 crosvm `b6c9027` + `baf456e`
++ `ce5a1d2` 三個 commit 修好，並在 5568 上實測通過——Windows 認到磁碟也跑出吞吐量，Linux 無回歸。**
+- 現象：13:29:40.360 `usb_hub: backend attached to port 9`，33 ms 後
+  `ERROR devices::utils::event_loop] removing event handler due to error: command ring TRB failed:
+  failed to config endpoint: bad stream context type: 0`（全 log 就這一條）。接著是 13 次
+  `Write to crcr while command ring is running` / 13 次 `xhci: stopping all device slots and resetting
+  host hub`，每 ~10 秒一輪（13:29:45 到 13:31:41）——那是 Windows 的 command-ring watchdog 在重試。
+  Guest 端始終只有 VirtIO 系統碟，沒有任何 PhysicalDrive。
+- 根因：`device_slot.rs:876-886` 的 `create_stream_trcs()` 把主 Stream Context Array 的
+  `1..1<<(max_pstreams+1)` 每一格都讀出來，**只要有一格的 SCT 不是 1（Linear）就整個 Configure Endpoint
+  失敗**；Windows 給的陣列裡有 SCT=0 的格子（未用/停用的 stream，或指到 secondary array），於是回
+  `BadStreamContextType(0)`。Linux 的 uas 沒事，是因為它把每一格都填成 Linear。
+- 第二層傷害：這個錯誤是從 command ring 的 handler 一路往外丟到 `event_loop`，`event_loop` 的處理方式是
+  **把整個事件處理器移除**，之後這台 xHCI 對 guest 就是死的。乾淨 detach + 再 attach 一次驗證過：
+  13:32:14 有 `backend attached to port 9`，之後到 VM 關機為止**沒有任何 xHCI 流量**——處理器一旦拆掉，
+  這台 VM 的生命週期內就回不來了。guest 造成的 context 錯誤本來就該回一個 completion code 給
+  command ring（讓 guest 自己處理），不該拆事件處理器。
+- 附帶：兩份 Linux crosvm log 在 attach **之前**也各有一條同樣的
+  `Write to crcr while command ring is running` 加兩條 `stopping all device slots`（13:11:05 / 13:23:43），
+  是開機期的，之後列舉正常，不影響上面的數字，但那是同一個字串。
+- 修法一（`b6c9027`）：SCT=0（Not Valid）是規範保留給「未使用的格子」的值（xHCI 1.2 6.2.4.1 Table 6-13），
+  Configure Endpoint 照 4.6.6 只驗 Input Context 的欄位、根本不該走 Stream Context Array，Stream Context
+  是在該 stream 變成端點的 current stream 時才讀（4.12.1.1），Not Valid 是**用的時候**才算錯。所以：
+  stream ring 改成 `Vec<Option<…>>`（index = stream id − 1，`None` = Not Valid），主陣列一次讀一格 16 B
+  的 Stream Context（不再一口氣讀固定 16 格的陣列，MaxPStreams=1 的 64 B 陣列落在頁尾也不會越讀），
+  SCT 2–7（secondary array）warn 後當 Not Valid。guest 造成的 Input Context 錯誤一律回 completion code：
+  MaxPStreams 超過 MaxPSASize／非 bulk 端點開 streams／LSA=0／EP Type 0／陣列或 Input Context 讀不到 →
+  Parameter Error，host 配不出 streams → Resource Error，slot 不在 Addressed/Configured → Context State
+  Error（4.6.6）；只有 host 自己的故障才回 Err，**command ring 的處理器不會再被拆掉**。doorbell 打到
+  Not Valid、id 0、超出陣列或打到沒有 streams 的端點，一律忽略（4.12.2）。
+- 修法二（`baf456e`）：帶 Stream ID 的 Set TR Dequeue Pointer 照 4.6.10 只改那一格 Stream Context
+  （指標／DCS／SCT），**不碰 Endpoint Context 裡那個指向 Stream Context Array 的指標**——先前它把 ring
+  指標寫進 Endpoint Context，之後每次 Stop/Reset Endpoint 或 halt 就把「stream context」從 transfer ring
+  讀出來又寫回去、蓋掉 guest 的 TRB。guest 用 SCT=1 設一格原本 Not Valid 的 stream 就在那裡補建 ring
+  （lazy init，這正是軟體初始化 stream 的方式，Windows 一次開一條）。host 端的 USBDEVFS streams 改成在
+  slot reset（HCRST）、Disable Slot、以及同一個端點被重新 add 時就先釋放，否則下一次 alloc 拿到 EINVAL、
+  變成 guest 永遠重試的 Resource Error。
+- 修法三（`ce5a1d2`，兩份獨立審核抓到的收尾）：Configure Endpoint 改成「先驗證、再動手」——所有要 add 的
+  Input Endpoint Context（EP Type、MaxPStreams、bulk-only、LSA、陣列讀不讀得到）全部檢查完，才 drop／
+  複製／建 ring／配 host streams，被打回的命令不會在 Output Context 留下半套（4.6.6：失敗的命令不得改動
+  Output Device Context）；Add-only 從 stream 端點改回一般 bulk 也會先釋放 host streams；Set TR Dequeue
+  帶 SCT≠1 就把該 stream 的 ring 收掉，讓 Stream Context 與控制器對 Not Valid 的認知一致；
+  `free_host_streams` 不再回 Err（slot 沒有 port 只 warn），不然它自己又會拆掉 command ring 處理器。
+- host 單元測試 47 個全過（改版前 24），涵蓋陣列走訪的純函式、DeviceSlot fixture 的 Configure Endpoint /
+  Set TR Dequeue / Stop Endpoint，以及「被拒絕的命令仍然發出 completion event」這條回歸。
+- **實機驗收（2026-09-05／06 深夜，5568，手動 launcher，crosvm md5 `f8029b85…`＝`ce5a1d2`）：**
+  - Windows pseudo-unprotected：attach 30 秒後 `USB\VID_152D&PID_A583\…` 認成
+    `USB Attached SCSI (UAS) Mass Storage Device`（SCSIAdapter、Status OK、problem=0），`Get-Disk` 看到
+    Disk 1 UNITEK 4096805658624 B、Offline / ReadOnly（attach 前先把 `NewDiskPolicy` 設成 `OfflineAll`，
+    事後還原 `OnlineAll`，所以整輪沒有任何東西寫進 SSD，Get-Volume 也沒有多出磁碟區）。raw 未緩衝讀
+    （`FileStream` + `FILE_FLAG_NO_BUFFERING`，`\\.\PhysicalDrive1`）2000×1 MiB 三趟
+    **274.8 / 322.5 / 332.7 MB/s**，4 KiB 隨機 2000 次 **2530 IOPS**。
+  - ETW（USBXHCI/USBHUB3/UCX/Kernel-PnP 兩次擷取）：命令 12/12 與 16/16 全部 completion code 1、零未配對；
+    決定性的一條是 `fid_NumStaticStreams=0xF`——先前被拒收的那個 15 格 static stream 陣列被接受了——後面
+    跟著 UCX 的 stream pipe 建立；stream 傳輸 10293 筆 = 1599.7 MiB。
+  - detach／re-attach：detach 後 27 秒 guest 端磁碟消失、host 端驅動收回；re-attach 30 秒後 Disk 1 回來、
+    15 條 stream 重建，500 MiB 讀 311 MB/s。沒有任何 Resource 警告或 `already has host streams`。
+  - Linux protected 回歸（同一支 binary、同一種 launcher）：`uas` 綁上、沒有 `UAS is ignored`，buffered dd
+    **326 / 344 MB/s**，fio（terse 第 7 欄是 KiB/s，換算後）seq qd1 **253 MB/s**、qd8 **429 MB/s**、
+    rand4k qd1 **1458 IOPS**、qd32 **6728 IOPS**。
+  - 兩邊 crosvm log：`removing event handler` / `config endpoint` / `Not Valid` / `Parameter Error` /
+    `ContextStateError` / `Resource` / `failed to cancel` 全部 0，只剩 INFO 的
+    `transfer ring slot_1 ep_7 stream_N is already stopped`；watchdog 242 個取樣 `HOST_REBOOT` = 0，
+    兩個 guest 都是從裡面關機、crosvm 正常退出，收尾 pool 3072、host 驅動與 volume 都回來。
+- **審核員留下的待追（都不致命，但沒解釋）：**
+  - UAS status pipe（stream 端點 ep_7）上，每次 Stop Endpoint 到接下來的 Set TR Dequeue 中間固定卡 **4.0 秒**，
+    三次都一樣，每次收尾都是一顆 URB 被取消（`0xC0000120`）——crosvm 對被 Stop Endpoint 取消的 TD 不發
+    Stopped 傳輸事件；re-attach 時另外還有一段 12 秒沒有流量。結果是 `disk.sys` 起來要 6 秒（首次）／
+    22 秒（re-attach），每次列舉必現。
+  - fio rand4k qd32 6728 IOPS 比先前的 9099 低 26%（qd1 反而從 1195 升到 1458），單次取樣，待追。
+  - Windows console log 開頭那個 BSOD 0x50 屬於上一輪 FAILED 的強制關機，不是本輪的。
+  - 「沒有 Not Valid doorbell」在 info 等級的 log 證不出來（那幾條訊息是 `debug!`）。
+
+**HCRST 缺陷（2026-09-05 深夜由 M4 的「VM 開機觸發」測出，`11c5462` 仍在）：HCRST 沒有重置
+command ring／CRCR／interrupter，開機前就接上的裝置會讓整台 xHCI 在 guest kernel 起來之前就死掉——
+已由 crosvm `391518c`（cherry-pick 自 `eb47f50`）修好，裝機驗證中。**
 - 現象（5568 的 Ubuntu app VM，daemon 的自動接入規則在 `vm_start` 後約 10 秒 attach，也就是 guest firmware
   還沒碰 xHCI 之前；3/3 必現）：`usb_hub: backend attached to port N` ＋ `port N changed before the guest set up
   its event ring; the change waits in PORTSC`，1.2 ms 後 `device_slot: xhci: stopping all device slots and
@@ -499,13 +573,30 @@ command ring／CRCR／interrupter，開機前就接上的裝置會讓整台 xHCI
   USBCMD=0（R/S=0）、USBSTS.HCH=1、CRCR=0（CRR=0、指標 0、RCS 0）、DCBAAP=0、CONFIG=0、DNCTRL=0、IMAN=0、
   IMOD 預設、ERSTSZ/ERSTBA/ERDP=0、所有 device slot disable、port reset；CRCR 的預設值本來就是 0，
   CRR 是它唯一可讀的位元。
-- 修法（進行中）：`Xhci::reset()` 等所有 ring 停妥之後一次做完——CRCR 歸 0、command ring controller 歸位
-  （dequeue pointer 0、consumer cycle 回初值、狀態 Stopped）、interrupter 回到「未初始化」的初始狀態
-  （event ring、IMAN/IMOD/ERSTSZ/ERSTBA/ERDP、moderation timer 解除）、DCBAAP/CONFIG 歸 0、USBSTS 清 CNR 並設
-  HCH；crcr 暫存器的 `reset_value` 改成 0（規範預設值），寫入遮罩維持不讓 guest 設 CRR。
+- 修法（`391518c`）：`Xhci::reset()` 建一個 `RingBufferStopCallback`，同時交給 command ring 與所有
+  transfer ring；等每一條 ring 都停妥之後一次做完——command ring 歸位（dequeue pointer 0、consumer cycle
+  回初值、狀態 Stopped），CRCR／DCBAAP／CONFIG／DNCTRL 回 reset value，`Interrupter::reset()`（event ring
+  回到「未初始化」、IMAN/IMOD/ERSTSZ/ERSTBA/ERDP 回初值、moderation timer 解除）——**這一步排在 slot ＋ hub
+  reset 之前**，這樣 hub reset 重貼的連線變化才會乖乖等在 PORTSC 裡，而不是寫進上一個 guest 的 ERST——
+  然後 slot ＋ hub reset，最後 USBSTS 設成 HCH|CNR 再把 CNR 清掉。crcr 暫存器的 `reset_value` 從 9 改成 0
+  （規範預設值，那個 9 ＝ RCS|CRR 就是 CRR 從上電就是 1 的來源），寫入遮罩維持不讓 guest 設 CRR，
+  CRCR 讀出來只有 CRR 一個位元（規範 5.4.5）。
+- 順帶把 CRCR 的 CS/CA 補上：帶 CS 或 CA 的寫入會把 command ring 停下來、清掉 CRR、發一個完成碼 24
+  （Command Ring Stopped）的 Command Completion Event——這就關掉了本節前面記的那條「命令逾時時 Linux 的
+  abort 救不回來」：Linux 寫 CA 之後輪詢 CRR 五秒，CRR 永遠是 1 就會判 `Abort failed to stop command ring:
+  -110` → `HC died`。
+- 審核抓到、一併修掉的三件事：`event_loop.rs` 在重新上鎖前先把 handler 的 `Arc` 放掉（非同步 reset 路徑上，
+  callback 跑在某條 ring 的 `on_event` 裡，slot reset 會丟掉那條 ring 的最後一個參照，drop 又回頭鎖同一把
+  handlers mutex → 整個 xHCI event loop 自我死鎖）；`RingBufferController::stop` 把 ring 停成 Stopped 時
+  會把先前積著的 stop callback 一起發掉（不然它們晚一步觸發，會撞上剛被重置的 event ring）；event ring
+  還沒初始化時的完成事件改成 debug log 丟掉，而不是讓整台控制器 fail。
+- 測試：cherry-pick 併回 stream 那三個 commit 之後，host 單元測試 51 個全過（interrupter reset、idle ring
+  立刻停下並從新指標續跑、Stopping ring 的 stop callback 全數發出、event ring 未初始化時完成事件被丟棄）。
 - 一併關掉的風險：`11c5462` 的延後 PORTSC 是靠「event ring 尚未初始化」判斷的，但 HCRST 之後 interrupter 還握著
   firmware 那份 event ring；kernel 自己 HCRST 時 hub reset 重貼的 port change 事件會被寫進 firmware 的 ERST
   記憶體——那塊記憶體已經歸 kernel 用了，是一條會默默弄髒 guest 記憶體的路。把 interrupter 一起重置就沒了。
+- 狀態：**已修，裝機驗證中**（APK md5 `1e7f5b95…`，crosvm md5 `b55fcee2…`；§9.3 那輪實機跑的
+  `f8029b85…` 是 `ce5a1d2`，還沒帶這個修正）。
 
 ### 9.2 Windows 重驗（2026-09-05，crosvm `4c6d149` → `d2f4b57`）
 
@@ -583,7 +674,7 @@ command ring／CRCR／interrupter，開機前就接上的裝置會讓整台 xHCI
   stopped）→ 第二次開啟才成功。Linux 是輪詢 PLS 所以沒事。修法：LWS 寫入把已連線的 port 從 U3/Resume 帶回 U0
   時，設 PLC（bit 22）並送 Port Status Change Event（spec 4.15.2.2）。
 - 未做：USBCMD.EWE 的 MFINDEX Wrap Event（每 2.048 秒一個事件 TRB）；若 Windows 有開 EWE 再補。
-- 未做：**stream context 的 SCT=0 容忍**——`create_stream_trcs()` 現在要求主 Stream Context Array 的每一格
+- 未做：**stream context 的 SCT=0 容忍**——`create_stream_trcs()` 現在要求主 Stream Context Array 的每一格（已修：crosvm `b6c9027`/`baf456e`/`ce5a1d2`，見 §9.1）
   都是 Linear（SCT=1），Windows 的 UASP 給了 SCT=0 的格子就整個 Configure Endpoint 失敗；而且**guest 造成的
   context 錯誤必須回一個 completion code 給 command ring**，不能像現在這樣把 xHCI 的事件處理器整個拆掉
   （拆掉之後這台 VM 的 xHCI 就再也回不來）。這是 §9.3 Windows 那列 FAILED 的唯一原因。
@@ -636,11 +727,16 @@ Windows 在 attach 前先關 automount（`mountvol /N`，`NoAutoMount` 空→1�
 | host baseline（`sdg`，uas，無 VM） | 370.3 MB/s | 未測 | 未測 | 未測 | 未測 | — |
 | Linux protected（without-firmware，`--swiotlb 256`） | 234 MB/s | 233.9 MB/s | 388.7 MB/s | 1195 IOPS | 9099 IOPS | 101.2%（/800%） |
 | Linux pseudo-unprotected | 264 MB/s | 263.8 MB/s | 385.5 MB/s | 1330 IOPS | 9791 IOPS | 95.2%（/800%） |
-| Windows pseudo-unprotected | FAILED | FAILED | FAILED | FAILED | FAILED | n/a |
+| Windows pseudo-unprotected（`f8029b85` 重測） | 274.8 / 322.5 / 332.7 MB/s（raw 未緩衝讀） | 未測 | 未測 | 2530 IOPS（非 fio） | 未測 | 未量 |
+| Linux protected（`f8029b85` 重測，同一種 launcher） | 326 / 344 MB/s | 253 MB/s | 429 MB/s | 1458 IOPS | 6728 IOPS | 未量 |
 
-Windows 整列 FAILED 的理由是同一個：磁碟從頭到尾沒列舉出來（`Get-Disk` 只看得到 VirtIO 系統碟，
+本輪（`11c5462`）Windows 整列量不到：磁碟從頭到尾沒列舉出來（`Get-Disk` 只看得到 VirtIO 系統碟，
 沒有任何 PhysicalDrive），因為 crosvm 的 Configure Endpoint 被 `bad stream context type: 0` 打回、
-xHCI 的事件處理器當場被拆掉，一個測項都沒跑到（見下面那條缺陷）。
+xHCI 的事件處理器當場被拆掉，一個測項都沒跑到。表上 Windows 那列的數字是 2026-09-05／06 深夜用修好的
+binary（`f8029b85` ＝ `ce5a1d2`）重量的，量法跟 Linux 不同：raw 未緩衝 `FileStream` 讀
+`\\.\PhysicalDrive1`（磁碟全程 offline / read-only），三趟 2000×1 MiB 分別 274.8 / 322.5 / 332.7 MB/s，
+4 KiB 隨機是自寫的 2000 次讀迴圈（2530 IOPS），Windows 端**沒有跑 fio**，所以 qd8/qd32 兩欄空著。
+同一輪的 Linux protected 重測列在下一行（詳見 §9.1 的 streams 條目）。
 
 數字的細節：host 的五次 1M 是 273.0（冷、首次觸碰，排除）、370.3、367.0、373.6、371.3，run2–5 平均
 370.5；另外 bs=4M×500 = 369.0、bs=128k×8000 = 305.0。Linux protected 的兩次 1M 是 229 / 234，
@@ -666,25 +762,9 @@ xHCI 的事件處理器當場被拆掉，一個測項都沒跑到（見下面那
   exit 處理。§5 的 R8「USB3 儲存估計 CPU 綁定在幾百 MB/s」成立。
 - 唯一沒法從資料切開的：fio `--size=8G --time_based` 每輪都重讀同一段 8 GiB，qd8 超過 host qd1 這件事
   既可能是佇列變深、也可能是外接盒/SSD 自己的快取，證據分不出來。
+- 重測那一列的兩處對不上，都還沒解釋：dd 從 234 升到 326 / 344 MB/s、fio qd1 從 233.9 升到 253 MB/s——
+  stream 的修法對 Linux `uas` 不該有這種效果（它本來就每格都填 Linear、走的是同一條路），兩邊都是單次
+  取樣，先當變異度看；反過來 rand4k qd32 從 9099 掉到 6728 IOPS（−26%）也是同一個問題，**待追**。
 
-**新缺陷（`11c5462` 仍在，待修）：Windows 的 UASPStor 要 USB 3.0 bulk streams，crosvm 的
-Configure Endpoint 直接拒收，整台 xHCI 就死了。**
-- 現象：13:29:40.360 `usb_hub: backend attached to port 9`，33 ms 後
-  `ERROR devices::utils::event_loop] removing event handler due to error: command ring TRB failed:
-  failed to config endpoint: bad stream context type: 0`（全 log 就這一條）。接著是 13 次
-  `Write to crcr while command ring is running` / 13 次 `xhci: stopping all device slots and resetting
-  host hub`，每 ~10 秒一輪（13:29:45 到 13:31:41）——那是 Windows 的 command-ring watchdog 在重試。
-  Guest 端始終只有 VirtIO 系統碟，沒有任何 PhysicalDrive。
-- 根因：`device_slot.rs:876-886` 的 `create_stream_trcs()` 把主 Stream Context Array 的
-  `1..1<<(max_pstreams+1)` 每一格都讀出來，**只要有一格的 SCT 不是 1（Linear）就整個 Configure Endpoint
-  失敗**；Windows 給的陣列裡有 SCT=0 的格子（未用/停用的 stream，或指到 secondary array），於是回
-  `BadStreamContextType(0)`。Linux 的 uas 沒事，是因為它把每一格都填成 Linear。
-- 第二層傷害：這個錯誤是從 command ring 的 handler 一路往外丟到 `event_loop`，`event_loop` 的處理方式是
-  **把整個事件處理器移除**，之後這台 xHCI 對 guest 就是死的。乾淨 detach + 再 attach 一次驗證過：
-  13:32:14 有 `backend attached to port 9`，之後到 VM 關機為止**沒有任何 xHCI 流量**——處理器一旦拆掉，
-  這台 VM 的生命週期內就回不來了。guest 造成的 context 錯誤本來就該回一個 completion code 給
-  command ring（讓 guest 自己處理），不該拆事件處理器。
-- 附帶：兩份 Linux crosvm log 在 attach **之前**也各有一條同樣的
-  `Write to crcr while command ring is running` 加兩條 `stopping all device slots`（13:11:05 / 13:23:43），
-  是開機期的，之後列舉正常，不影響上面的數字，但那是同一個字串。
-
+**打死整台 xHCI 的那個 `bad stream context type: 0`（本輪 Windows 量不到東西的原因）：診斷、三個 commit
+的修法、以及修好之後的實機驗收，全部記在 §9.1。**
