@@ -1,7 +1,7 @@
 # USB 透傳：Android 端接線計劃（2026-09-04）
 
 > 狀態（2026-09-04 收工）：§2、§3、§5 階段 A/B 與 M5 已完成並實機驗收（見 USB_PASSTHROUGH_SURVEY.md §8）；
-> §4 app 頁面（M3）與 §2.4 自動規則（M4）未做。
+> §4 app 頁面（M3）未做；§2.4 自動規則（M4）2026-09-05 定案、實作中。
 
 前提（USB_PASSTHROUGH_SURVEY.md 的結論）：Linux guest 走 protected + restricted-dma-pool，
 Windows guest 走 pseudo-unprotected；兩者 host 端機制相同，差別只在 crosvm 的 gate。本文只講
@@ -79,18 +79,65 @@ daemon 用 `FileObserver`（inotify，`app_process` 裡可用）盯 `/dev/bus/us
 - 拒絕 attach 的情況：hub、root hub、VM 不在 RUNNING、VM 是 protected + Windows（沒有 xHCI，
   survey R2）、port 用完。
 
-### 2.4 規則（存在 VM config）
+### 2.4 自動接入規則（M4，2026-09-05 定案）
+
+**一份全域規則檔，四層，每層一個有序 list；順序即優先。** 規則不放 VM config（跨 VM 的先後是規則的一部分）。
+檔案 `usb_rules.json`（app files 目錄，UI 寫檔；存檔時整份經 IPC `usb_rules_set` 推給 daemon，daemon 啟動時也讀檔）：
+
 ```json
-"usb_devices": [
-  { "vid": "090c", "pid": "1000", "serial": "1400973503822014", "auto": true },
-  { "port_path": "1-1.2", "auto": true },
-  { "vid": "0bda", "pid": "8153", "auto": false }
-]
+{
+  "version": 1,
+  "exact":  [ { "id": "0020:0b21:20210726905926", "port": "1.2.2", "vm": "<uuid>" } ],
+  "port":   [ { "port": "1.2.4", "vm": "<uuid>" }, { "port": "1.6", "vm": null } ],
+  "device": [ { "id": "32e6:9221:202510220951", "vm": "<uuid>" } ],
+  "any":    [ { "vm": "<uuid>" }, { "vm": "<uuid2>" } ]
+}
 ```
-- `vid/pid`（必）+ `serial`（選，區分同型號）；`port_path`（選，= hub 的哪個孔，換裝置也接）；
-  `auto`：true = 插入即接、VM 開機掃一次；false = 只在 UI 手動接時當作「已知裝置」。
-- class 規則（例如「所有 mass storage」）第二階段再加。
-- 多個 RUNNING VM 同時命中：先到先得（VM 開機順序 / 規則建立順序），並廣播衝突事件給 UI。
+
+- **識別碼 `id`**：`vid:pid:serial`，沒有 serial 就是 `vid:pid`（小寫 hex）。重插不變；兩顆同型無 serial 的裝置同一個 id，先插先配。
+- **路徑 `port`**：sysfs 名去掉 bus 前綴後的 port 鏈：`1-1.2.2` → `1.2.2`、`2-1.4` → `1.4`。同一個實體 port 上 USB2 裝置列舉在 bus 1、USB3 裝置在 bus 2，去掉 bus 才對得到實體 port。
+- **`vm: null` = 留給 host**：命中即停止匹配（用來保住給 Android 用的滑鼠/鍵盤，配合第 4 層吃剩下的）。`any` 層的項目只有 `vm`，不允許 null。
+
+**觸發（只有這三種；VM 停止/重啟造成的釋放不觸發）：**
+1. USB 插入：現有 inotify CREATE → rescan（composite 節點分批出現，debounce 300–500 ms 後跑一次）。
+2. VM 進入 RUNNING（`UsbPassthroughManager.onVmState`），不等 guest 開完機。
+3. 規則存檔（`usb_rules_set`）。
+
+**候選集合**：每次觸發都對「已插入、未接入任何 VM、未 `held`、非 hub」的全部裝置跑一遍（已接入的本來就不在集合，重跑冪等）。
+
+**演算法**（在 manager 的 lock 內）：
+```
+for d in 候選:
+  for layer in [exact, port, device, any]:
+    for rule in layer (list 順序):
+      if not match(rule, d): continue
+      if rule.vm is None: 留在 host; break 到下一個 d
+      if VM(rule.vm).state != RUNNING: continue
+      if d.failed_for == rule.vm: continue        # 本輪不重試
+      attach(d, rule.vm) 走現有 attach 路徑，記錄 source=auto, layer, rule index
+      成功 → 廣播 usb_auto_attached; 失敗 → d.failed_for = rule.vm，log warn；break 到下一個 d
+```
+推論（已確認）：第 2 層 port 規則的 VM 沒在跑時，第 3 層可以拿走該 port 上的裝置；第 4 層由 list 裡第一台在跑的 VM
+拿走所有漏網；規則改動不會 detach 已接入的裝置（不搶）；VM 重啟 = REBOOTING 釋放 + RUNNING 再匹配，裝置自己回來。
+
+**`held`**：使用者手動 detach（usb_detach / usb-detach / UI）後該裝置實例設 `held=true`，之後任何觸發都跳過它；
+只有拔出（inventory 看到節點消失）才清除。規則存檔不清除。`failed_for` 同樣在拔出時清除。
+
+**IPC**（沿用 `type:"request"` 框架；錯誤照現有 RequestException）：
+- `usb_rules_get` → `{ rules: <上面的 JSON> }`
+- `usb_rules_set { rules }` → 驗證（層名、id/port 格式、vm 存在或 null、any 不得 null）、存入 daemon 記憶體、寫檔、
+  跑一次匹配 → `{ applied: n }`
+- `usb_rules_test` → dry-run，對每個已插入裝置回 `{ sysfs, id, port, held, attached_vm, result: { layer, index, vm } | { layer, index, vm: null } | null }`，不真的接
+- `usb_host_list` 每個裝置加 `id`、`port`、`held`、`auto_rule`（若由規則接入：`{layer,index}`）
+- 事件 `usb_auto_attached { vm_id, vm_name, sysfs, id, port, layer, index }`；attach 失敗 `usb_auto_failed { ..., error }`
+- console：`droidvm usb-rules` 印目前規則；`usb-rules test` 印 dry-run 表；`usb-rules set <file>` 從 JSON 檔設定。
+
+**單元測試（app/src/test，純 JVM，仿現有 usb 測試）**：id/port 推導（有無 serial、bus 1/2）；四層順序與 list 順序；
+非 RUNNING 跳過；null 留 host；any 取第一台在跑的；held/failed 跳過；同一裝置只接一次；規則存檔不搶已接入。
+
+**實機驗證（5568 一次只能跑一台 VM，多 VM 順序留給單元測試）**：模擬拔插用 sysfs——`echo 1 > /sys/bus/usb/devices/<dev>/remove`
+移除，再對 hub `echo 1-1.2 > /sys/bus/usb/drivers/usb/unbind && echo 1-1.2 > .../bind` 讓 hub 重新列舉（子裝置以新 devnum
+重新出現，inotify 看到 CREATE，等同重插）；真實拔插由使用者手動補測。
 
 ### 2.5 事件時序
 | 事件 | daemon 做什麼 |
