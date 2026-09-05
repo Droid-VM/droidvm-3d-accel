@@ -180,6 +180,13 @@ host 端 USB：
   + `USB_ROLE_SWITCH` + `USB_XHCI_HCD`，`xhci-hcd` 平台驅動在。調查時 port 都不在 host 角色
   （5568 甚至正以 device 身分接在某台電腦上，`/sys/class/udc/a600000.dwc3/state = configured`），
   `/sys/bus/usb/devices` 空。adb 走網路，USB-C 是空的，OTG 接上裝置 dwc3 就會切 host。
+- **rig 註記（2026-09-06 補）**：5568 的 Type-C OTG 連結在同一輪測試裡掉了兩次，整棵 USB 樹跟著消失
+  （dmesg `[LENOVO_UCSI] cur_role = HOST, new_role = NONE, present = [0 0]`、
+  `xhci-hcd xhci-hcd.1.auto: USB bus 1/2 deregistered`，`/sys/bus/usb/devices` 全空、
+  `dumpsys usb` `host_connected=false`）。第一次從 host uptime 463 s 到 1633 s（約 19.5 分鐘），起 app
+  daemon 時整棵樹自己回來；第二次在 18:44 又掉一次、幾秒後自行重新列舉（devnum 全換）。全程沒有碰硬體，
+  也沒有動 `msm-dwc3` 的 `mode` 開關。跑實機測試時要把這種消失和 crosvm 的問題分開看（§9.1 的 WS3a 就是
+  被它作廢的）。
 - usbfs 節點規則：ueventd `/dev/bus/usb/* 0660 root usb`。crosvm 由 root daemon fork，
   實測 `uid 0`、`u:r:magisk:s0`，可直接開 `/dev/bus/usb/BBB/DDD`。
 - 已有的 app 管線：`--no-usb` 開關（`CrosvmBackendInstance.java:430-431`，UI 在 Basic 分頁
@@ -639,7 +646,8 @@ command ring／CRCR／interrupter，開機前就接上的裝置會讓整台 xHCI
     `is already stopped` 0 條（run1 是 1 條 ERROR ＋ 77 條），吞吐量見 §9.3。
 
 **Stop Endpoint 不回報進行中的 TD（沒有 Stopped transfer event），Windows 每次 stop 固定等 2–4 秒——
-已由 crosvm `dc1e0bf` + `9293b36` + `13242f9` 三個 commit 修好，2026-09-06 已編譯，裝機驗證中。**
+已由 crosvm `dc1e0bf` + `9293b36` + `13242f9` 三個 commit 修好；2026-09-06 實機驗證：Windows 每次 stop 的
+4 秒／2 秒收斂到 1 ms，Linux 另外掉出一個 isochronous 的 Stopped 事件回歸（修正中）。**
 - 現象（ETW，scratchpad `m6b/uas/run1` 的 `4W2-etw.txt`、`usbtrace-w*.xml`）：三個週期一模一樣——UAS
   data-in stream 端點（slot 1 DCI 7）的 Stop Endpoint 在 1 ms 內就拿到 completion code 1，接下來
   **4.008／4.015／4.000 秒**之內沒有任何 USBXHCI／UCX／USBHUB3 事件，等滿了才是 Set TR Dequeue，
@@ -704,10 +712,58 @@ command ring／CRCR／interrupter，開機前就接上的裝置會讓整台 xHCI
   `a_second_stop_while_stopping_does_not_cancel_again`／`moving_the_ring_clears_the_stopped_record`。
   in-tree 沒有假的 `XhciBackendDevice`（只有 host 與 fido 兩個後端），所以「Stopped 真的排在 Command
   Completion 之前」這一條只能靠實機驗。
-- 狀態：**已編譯（crosvm md5 `9ccc9856…`＝`13242f9`），裝機驗證中**——預期 Stop Endpoint 到 Set TR
-  Dequeue 的間隔從 2–4 秒降到毫秒級、`WatchdogTriggered` 消失、`disk.sys` 的 6 秒／22 秒一起收斂；
-  音效與攝影機那些 isochronous／interrupt 路徑每次 stop 的 2.0 秒也會跟著沒掉，那是改動影響最大的地方，
-  要一併重跑。
+- 狀態：**Windows 實機通過、Linux 掉出一個新回歸**（2026-09-06，5568，crosvm md5
+  `9ccc9856…`＝`13242f9`，兩邊都是手動 launcher，不經 app）。證據在 scratchpad `m6b/uas/run3`
+  （Windows `w3WS1*`／`w4WS2*`／`w5WS3*`／`w6-*`／`w7-final.txt`，Linux `l*.txt`，兩支 `monitor-*.log`）。
+  ETW 的每一段間隔都由第三方稽核用自己寫的 TRB 解碼器（Stop Endpoint ＝ TRB type `0x0F`、Set TR Dequeue
+  ＝ `0x10`，取 dword3 的 bits 15:10，比對 submit／completion 時遮掉 cycle bit）從原始 timeline 重算一次，
+  與跑測那份**到 1 ms 內完全一致**。Windows（pseudo-unprotected）這一輪的每一次 Stop Endpoint：
+
+| 情境（端點） | → Command Completion | → Set TR Dequeue | 修好之前 |
+|---|---|---|---|
+| WS1 UAS 第一次 attach（slot 1 ep_7 data-in stream） | 1 ms | 1 ms | 4009／4015／4002 ms |
+| WS2 detach → re-attach（slot 1 ep_7） | 0 ms | 0 ms | 同上 |
+| WS3b 音效 isochronous OUT（slot 1 ep_6） | 1 ms | 1 ms | 2008 ms |
+| WS3b 攝影機 interrupt IN（slot 2 ep_3） | 1 ms | 1 ms | 2003 ms |
+
+  （右欄的 media 基準是 windows3／4／5 三輪 **26 次** pre-fix stop，每一次都落在 1990–2065 ms。）
+
+- Windows 其餘量測：被 cancel 的 TD 現在都在 stop 之後 **1 ms 內**以 `0xC0000120` 收掉（整輪 12 顆），
+  不用再等 Windows 的 watchdog——`Kernel-PnP 902 WatchdogTriggered` 因此 **0 次**（修好之前必現），
+  `disk.sys` 的 DeviceStart 是 **16 ms**（首次 attach）／**1984 ms**（re-attach），對上修好之前的
+  6003／22044 ms；`etw_decode` anomalies＝0、`USBXHCI 34`＝0。功能面全部正常：raw 未緩衝讀
+  `\\.\PhysicalDrive1` **290.4／289.2／303.8 MB/s**（磁碟全程 Offline／ReadOnly，attach 前先把
+  `NewDiskPolicy` 設成 `OfflineAll`、收尾還原 `OnlineAll`）；`PlaySync` ×3 **5306／5234 ms**
+  （基準 5.2–5.4 s，沒有變差）；攝影機拍照 118291 B、6 秒錄影 928947 B。
+- **WS3a 那一輪作廢，原因在治具不在 crosvm**：18:44:02–18:44:10 手機的 Type-C 掉了整棵 USB 樹
+  （見 §4 的 rig 註記），crosvm 在那兩次 stop 之後 0.4 秒就對 usbfs fd 拿到 `ENODEV`、reap 不回被 cancel
+  的 URB，也就發不出 Stopped 事件，Windows 退回自己的 2 秒計時器（2016／2011 ms）——注意那兩次的
+  Command Completion 仍然是 0／1 ms，等的只有 Set TR Dequeue。同一組情境在 WS3b 重跑就是上表的 1 ms。
+  「host 裝置節點在 stop 途中消失」這條路徑本來就不在這次改動的範圍內。
+- Linux（protected-without-firmware，`--swiotlb 256`）同一支 binary 全程重跑：音效 `speaker-test` rc=0、
+  零 xrun；攝影機自帶 mic `arecord` rc=0、64044 B（裝置談成自己原生的 16 kHz，正好 2 s×16000×2 B ＋ 44 B
+  header）；攝影機 3×60 幀 × 兩種格式 **6/6 rc=0**；UAS 綁上 `uas`。吞吐量 dd **226／251 MB/s**
+  （1000×1 MiB）與 **214／233 MB/s**（2000×1 MiB）——看起來比 §9.3 的 315／321 低，於是當場把前一支
+  binary（`b55fcee`）裝回去、用同一份腳本在同一小時內重量，得到 **230／221 MB/s**（fio 兩支差不到 10%），
+  **不是回歸**：run2 那組數字今天在產生它的那支 binary 上也重現不出來（機身 33–36 °C，不是熱節流）。
+  `failed to cancel` **0 條**（修好之前的 linux2 那輪是 62 條）。log 裡剩下的 3 條 ERROR 全是
+  `device slot is already enabled`，在 `b55fcee` 上 attach 第 2／第 3 顆裝置照樣一模一樣重現，是既有問題。
+- **新回歸（Linux，本輪抓到）：drain 過的 isochronous ring 對每一顆被 cancel 的 TD 都發一個 Stopped 事件，
+  不是只發進行中的那一顆。** guest 印了 **119** 條 `xhci_hcd ... Event dma <X> for ep 4 status 13 not part
+  of TD at <Y> - <Y>`（`ep 4` ＝ ep_index 4 ＝ DCI 5 ＝ UVC 的 isochronous video IN；status 13 ＝
+  `COMP_STOPPED`），同一份工作量在 `b55fcee` 上是 **0** 條。分成 6 陣、每次串流停止一陣、每陣 2–32 條；
+  guest 等的那顆 TD 只有一顆 TRB，而每一條事件都指向它前面、彼此互不相同的 TRB——整個 drain 過的視窗
+  都被回報成 Stopped，與修法二自己寫下的不變量（`xhci_transfer.rs`：「只有它會被回報 Stopped」、
+  「一次只報最早那一顆」）相牴觸。本輪的影響是良性的（6 次擷取全部 rc=0、沒有 uvc frame error），但有一個
+  **可能的副作用**：6 次擷取有 3 次只跑到 ~15 fps（15.03／15.00／15.00），`b55fcee` 對照組是
+  19.00／19.47／19.44，另外 3 次是 19.70／19.68／20.00——現有證據還不足以排除 iso 串流的 fps 回歸。
+  狀態：**修正中（`DESIGN-STOPPED-ISO.md`）**。另外要記住：**Windows 這一輪從頭到尾沒停過 UVC 的
+  isochronous video IN 端點**（WS3b 停的是音效 iso OUT 與攝影機 interrupt IN），所以這個缺陷在 Windows 上
+  的影響是沒量到的，修好之後的重驗一定要把它補上。
+- Watchdog／收尾：兩支 monitor（Windows 段 18:28–18:58、Linux 段 19:03–19:32）`HOST_REBOOT` 都是 **0**、
+  host uptime 單調上升；每次 launch 前 `PRECHECK_OK`、launch 後 `POSTLAUNCH_OK served=2048`；每個 guest
+  都是從裡面關機、crosvm 自己在 10 秒內退出（沒有 `crosvm stop`、沒有 kill），pool 收回 **3072**、
+  `served=0 active_vms=0`，host 端三顆裝置的驅動、`sdg` 與 `public:8,98` 全部還原。
 
 ### 9.2 Windows 重驗（2026-09-05，crosvm `4c6d149` → `d2f4b57`）
 
