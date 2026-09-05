@@ -471,6 +471,30 @@ xHCI 模型缺陷——不是 isochronous 的問題。**
 - 順帶查到、未修的次要缺陷：CRCR 的 Command Abort/Stop（CA/CS）沒實作，所以命令逾時時 Windows 的 abort 救不回來、
   直接升級成整台 reset（有了上面兩修正後不應再走到這裡）。
 
+### 9.2 Windows 重驗（2026-09-05，crosvm `4c6d149` → `d2f4b57`）
+
+`4c6d149`（moderation timer + halted ring + DCS + SETUP 重啟）裝上去後，Windows 這邊終於走到 isochronous：
+- 兩次 ETW（音效、攝影機）**anomalies=0**：沒有 watchdog、沒有 command timeout、沒有 controller reset；命令
+  submitted==completed。attach/detach 都乾淨，host 驅動每次都收回。
+- **攝影機通過**：Camera 節點 OK prob=0，用排程工作在 console session（session 1）跑 WinRT MediaCapture：
+  `photo ok ms=688 size=45759`（有效 JPEG 1920×1080 baseline）、6 秒 H.264 MP4 `size=8529`、ffprobe 53 幀
+  640×480。EP5（iso IN）203 個 URB、7 秒連續、中位間隔 16 ms，沒有任何停頓。注意事項：(a) MF frame server
+  只在互動 session 裡才看得到裝置（ssh 的 session 0 永遠 0 台），所以用 `Register-ScheduledTask` +
+  `LogonType Interactive` 在 console session 跑；(b) attach 後第一次開啟會回 `A device which does not exist
+  was specified`，20～30 秒後重試就成功，frame server 需要暖機；(c) 影像是全黑（stdev 0，鏡頭對著暗處），
+  結構（JPEG/H.264、幀數、時長）都是真的。錄影停止時 host log 噴 311 條 `failed to cancel ... DISCARDURB
+  EINVAL`（對已完成的 URB 取消，無害）。
+- **音效只通一半**：MEDIA 節點 OK prob=0、Render/Capture endpoint 都是 state=1、waveOut=waveIn=1，iso OUT
+  真的有資料（EP6 638 個 URB、0 rejected），但 5.7 秒的 WAV 要放 **31 秒**，錄音 rec.wav 是 0 byte。ETW 看到
+  OUT 串流每次剛好跑 **1.023 秒（≈1020 個 1 ms packet）就停 9.3 秒**，usbaudio 逾時後 Stop Endpoint → Set TR
+  Dequeue 回 ring 開頭（DCS=1）重來，6 次循環；IN 也是一段 1.02 秒後全靜。
+- **根因：MFINDEX 是死的。** `xhci_regs.rs` 把 runtime 暫存器 0x3000（MFINDEX，每 125 µs 加一的 microframe
+  計數器）做成 `static_register!` 恆為 0。USBXHCI 排 isochronous TD 的 frame ID 是相對 MFINDEX 算的，最多排到
+  MFINDEX 前方約 1024 個 frame；計數器不動，1.024 秒後就排不下去，等到 URB 逾時才重置管線。Linux 的
+  snd-usb-audio 不看 MFINDEX（ISO_ASAP 靠主機排程），所以 Linux 沒事。修法（`d2f4b57`）：`register_space`
+  加 `set_read_cb`，MFINDEX 讀取回傳自上次 HCRST 起的 125 µs tick 數（14 位元繞回）。實機重驗進行中。
+- 未做：USBCMD.EWE 的 MFINDEX Wrap Event（每 2.048 秒一個事件 TRB）；若 Windows 有開 EWE 再補。
+
 **結論：M6「把 isochronous 接線」在 protected Linux（本專案主目標）已達成並實測通過（音效播放/錄音、
 攝影機 30 fps、攝影機麥克風）。Windows pseudo-unprotected 的 isochronous 被一個獨立的、與 iso 無關的 interrupter
 中斷節流缺陷擋住，已在 `be6ad1c` + `453d09d` 修正，實機重驗見 §9.2；USB 基本功能（bulk 三顆）在 Windows pseudo 仍如 §8 驗過可用。**
