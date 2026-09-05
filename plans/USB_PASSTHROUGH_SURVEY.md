@@ -440,16 +440,26 @@ xHCI 模型缺陷——不是 isochronous 的問題。**
   的 command ring **對這顆 Set TR Dequeue Pointer 從未送出 Command Completion Event**。3 秒後 Windows 的
   command-ring watchdog 觸發（Kernel-PnP 902），5 秒後嘗試 abort（host log `Write to crcr while command ring
   is running`），再 5 秒 abort 逾時，最後整台 controller internal reset、slot/endpoint 全刪，裝置 FAILED_START。
-- 判定：這是 crosvm xHCI 模型的通用缺陷，任何在列舉期 STALL 控制端點的 Windows 裝置都會踩到（bulk 隨身碟/
-  CCID/NIC 之前沒踩到，是因為它們的控制端點在列舉期不 STALL）。Linux 同一顆裝置同一 crosvm 也會 STALL 控制
-  端點三次（host log 有 3 條 `endpoint is stalled`），但 Linux 的回復序列在 crosvm 上完成、音效正常——差別在
-  Windows 送的回復命令組合觸發了 crosvm command ring 漏發完成事件。Set TR Dequeue 這條路
-  （`command_ring_controller.rs::set_tr_dequeue_ptr` → `device_slot.rs::set_tr_dequeue_ptr`）純程式推理看起來
-  每條分支都會呼叫 `command_completion_callback`，實機卻沒送出；要用加日誌的 debug build 才能定位確切分支
-  （另一個已知的旁證：`device_slot::set_tr_dequeue_ptr` 只寫 dequeue pointer、沒套用 TRB 帶的 DCS bit，
-  `command_ring_controller` 也沒讀 DCS，等於忽略 dequeue cycle state；但那會影響之後的傳輸、不會讓命令本身漏回）。
+- **根因（2026-09-05 定位，crosvm `be6ad1c` 修）：不在 command ring，在 interrupter 的 interrupt moderation。**
+  `interrupter.rs` 每次發中斷記下時間並把 `moderation_counter` 設成 guest 寫的 IMODI（預設 1 ms）；之後每
+  加一個事件呼叫 `interrupt_if_needed()`，它要求距上次中斷 ≥ 250 ns × counter 才肯發，**還沒到就直接 return，
+  沒有任何 timer 會在窗口結束後補發**。真實硬體的 moderation 是「延到窗口結束」，crosvm 是「窗口內的事件
+  不發」，那個事件要等到下一個事件進來才被順便送出；guest 若正在等的就是它、且沒有別的事件會再來，就永遠
+  等不到。對上時間軸：Reset Endpoint 完成→中斷（t0）；Windows 在同一個 DPC 裡處理完、立刻送 Set TR Dequeue
+  （ETW 三條都是 pid 3068 同一 thread）；crosvm 在 t0 + 100～300 µs 完成它，落在窗口內，中斷被吞掉，之後這台
+  裝置再無事件。Linux 沒事是因為 xhci 驅動把 Reset Endpoint + Set TR Dequeue 一起排進 ring、只敲一次 doorbell，
+  兩個完成事件在同一輪進 ring，第一個中斷一次收兩個。9/4 那次的另一種死法（三次 stall 各隔 4 秒、無 reset）
+  是同一個 bug 吞掉**控制傳輸**的完成中斷：usbaudio 請求 4 秒逾時 STATUS_CANCELLED，取消（那些週期性的
+  「ep_1 is already stopped」就是 Stop Endpoint）重試，裝置再 STALL，三次後 FAILED_START。bulk 三顆沒事是
+  因為流量密集，被吞的中斷很快被下一個事件補上。
+- 修法（`be6ad1c`）：`Interrupter` 內加一個 one-shot timerfd，`interrupt_if_needed()` 在窗口內有事件時把
+  timer 設到窗口結束（一個窗口只 arm 一次），新的 `IntrModerationHandler` 掛在 xHCI event loop 上，timer 到期
+  再呼叫一次 `interrupt_if_needed()`。單元測試三個：無 moderation 每事件都中斷；窗口內事件在窗口結束後被送達
+  （修正前此測試失敗）；一個窗口內多個事件只 arm 一次。
+- 順帶查到、未修的次要缺陷：CRCR 的 Command Abort/Stop（CA/CS）沒實作，所以 Windows 的 abort 救不回來直接升級
+  成整台 reset；`device_slot::set_tr_dequeue_ptr` 沒套用 TRB 的 DCS 位元（`command_ring_controller` 也沒讀）。
 
 **結論：M6「把 isochronous 接線」在 protected Linux（本專案主目標）已達成並實測通過（音效播放/錄音、
-攝影機 30 fps、攝影機麥克風）。Windows pseudo-unprotected 的 isochronous 被一個獨立的、與 iso 無關的控制端點
-失速回復缺陷擋住，需要單獨修 crosvm command ring；USB 基本功能（bulk 三顆）在 Windows pseudo 仍如 §8 驗過可用。**
+攝影機 30 fps、攝影機麥克風）。Windows pseudo-unprotected 的 isochronous 被一個獨立的、與 iso 無關的 interrupter
+中斷節流缺陷擋住，已在 `be6ad1c` 修正，實機重驗見 §9.2；USB 基本功能（bulk 三顆）在 Windows pseudo 仍如 §8 驗過可用。**
 
