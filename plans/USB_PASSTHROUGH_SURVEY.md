@@ -547,9 +547,108 @@ xHCI 模型缺陷——不是 isochronous 的問題。**
   stopped）→ 第二次開啟才成功。Linux 是輪詢 PLS 所以沒事。修法：LWS 寫入把已連線的 port 從 U3/Resume 帶回 U0
   時，設 PLC（bit 22）並送 Port Status Change Event（spec 4.15.2.2）。
 - 未做：USBCMD.EWE 的 MFINDEX Wrap Event（每 2.048 秒一個事件 TRB）；若 Windows 有開 EWE 再補。
+- 未做：**stream context 的 SCT=0 容忍**——`create_stream_trcs()` 現在要求主 Stream Context Array 的每一格
+  都是 Linear（SCT=1），Windows 的 UASP 給了 SCT=0 的格子就整個 Configure Endpoint 失敗；而且**guest 造成的
+  context 錯誤必須回一個 completion code 給 command ring**，不能像現在這樣把 xHCI 的事件處理器整個拆掉
+  （拆掉之後這台 VM 的 xHCI 就再也回不來）。這是 §9.3 Windows 那列 FAILED 的唯一原因。
+- 未做：**bulk 的 drain-ahead / 讓多筆 URB 同時在途**。ring buffer controller 現在對 bulk 仍是深度 1
+  （完成才 dequeue 下一個 TD），單佇列吞吐量因此被每筆請求的來回延遲綁住——§9.3 量到 qd1 只有 host 的
+  63%／71%，但 qd8 一補上就回到 385–389 MB/s。iso 已經有 `set_dequeue_all`，bulk 需要一個有上限的等價機制。
 
 **結論：M6「把 isochronous 接線」在 protected Linux（本專案主目標）已達成並實測通過（音效播放/錄音、
 攝影機 30 fps、攝影機麥克風）。Windows pseudo-unprotected 起初被四層與 iso 無關的 xHCI 模型缺陷擋住（中斷節流丟中斷、halted ring 續跑 + DCS、
 控制傳輸狀態機、MFINDEX 不動）加一個 resume 缺陷，全部在 `be6ad1c`…`76ed342` 修掉；最終在兩種 guest、手動 launcher 與
 app daemon 路徑上，USB 音訊播放、UVC 攝影機影像、攝影機麥克風錄音都實測通過並經獨立審核（§9.2）。**
+
+### 9.3 USB 3.0 吞吐量（UNITEK NVMe 外接盒，`152d:a583`，UAS）
+
+2026-09-05 在 5568 上量的，crosvm `11c5462`（`wip/usb` HEAD；手動 launcher 跑的是
+`/data/local/tmp/usbtest/crosvm`，本輪沒留這支的 md5，同一版由 app 解出來的副本 md5
+`69aa3984be32eeec993c6161b7cdc05d`）。裝置是 UNITEK NVMe 外接盒 `152d:a583`（JMicron，serial
+DD564198838E9），插在 `0bda:0411` USB3.2 hub 底下、sysfs `2-1.1`、`speed=5000`（SuperSpeed /
+USB 3.x Gen1），host 端驅動 `uas`，區塊裝置 `sdg` = 8001573552 × 512 B = 4.10 TB（3.73 TiB），
+`max_sectors_kb=512`（hw 也是 512）。全程唯讀：dd 一律 `of=/dev/null`、fio 一律
+`--readonly --direct=1`、兩個 guest 進去先 `blockdev --setro`（回 `getro=1`）、guest 內從不掛載、
+Windows 在 attach 前先關 automount（`mountvol /N`，`NoAutoMount` 空→1，事後還原成 0）。
+
+- **Launcher / VM**：Linux protected 用手動 launcher `run_linux.sh`
+  （`--protected-vm-without-firmware --no-balloon --disable-sandbox --hugepages
+  --prepare-lend-mthp-mode chunked --swiotlb 256`、`--mem 4096 --cpus 4`、Ubuntu resolute qcow2）；
+  Linux pseudo 用同一份 launcher 只改四處（`--protected-vm-pseudo-unprotected`、拿掉 `--swiotlb 256`、
+  加 `DROIDVM_SHIM_PROBE_EXEC=1` 與 `DROIDVM_SHIM_PARCEL_MB=0`、log 檔名），tap / MAC / socket /
+  disk / name 全不動（diff 見 `perf/run/4-launcher-diff.txt`）。Windows 走 `windows.sock` 的手動
+  launcher；本輪證據裡沒有它的 launcher 檔，pseudo-unprotected 是靠 crosvm log 的簽名認的
+  （`GH-SHIM window`、`GUNYAH-SHARE-BLOB`、LEND 只有 4 MB + 2 MB）。
+- **工具**：host baseline 是 Android toybox
+  `dd if=/dev/block/sdg of=/dev/null bs=1M count=2000`，每跑一次先 `echo 3 > drop_caches; sync`，
+  **buffered（不是 O_DIRECT）**、唯讀、沒有任何 VM 在跑。guest 的 dd 是 uutils coreutils 0.8.0，
+  同樣 buffered + drop_caches（它的 `iflag=direct` 在 4k/128k/512k/1M 全部直接回
+  `IO error: Invalid input`，是 guest 工具的 bug，不是透傳問題），所以 O_DIRECT 的數字一律來自 fio：
+  `fio --name=<n> --filename=/dev/sda --readonly --direct=1 --ioengine=libaio --runtime=15
+  --time_based --size=8G --output-format=terse`，四組參數 `--rw=read --bs=1M --iodepth=1`、
+  `--rw=read --bs=1M --iodepth=8`、`--rw=randread --bs=4k --iodepth=1`、
+  `--rw=randread --bs=4k --iodepth=32`。
+- **單位**：toybox dd 印的 `M/s` 是 MiB/s，uutils dd 印的 `MB/s` 是 10^6 B/s，fio terse 第 7 欄是
+  KiB/s——差 4.9%，是個陷阱。下表全部換算成十進位 MB/s（bytes ÷ dd 自己量的 elapsed）。
+- **Watchdog**：monitor 從 13:07:53 跑到 13:35:00（310 個 5 秒取樣），`HOST_REBOOT` = 0，host uptime
+  單調從 1703 s 升到 3331 s——**整輪沒有 host reboot**。三次 VM 週期的 hugepage pool 轉換都對得上
+  （3072/0 ↔ 1024/2048），收尾 `pool_avail=3072 served=0 active_vms=0`、crosvm 0 個、`2-1.1:1.0` 回到
+  `uas`、`sdg` 回來、vold 重掛、兩條 tap 都不存在。
+
+| | dd 1 MiB 循序讀 | fio 1 MiB qd1 | fio 1 MiB qd8 | fio 4K 隨機 qd1 | fio 4K 隨機 qd32 | 期間 crosvm CPU |
+|---|---|---|---|---|---|---|
+| host baseline（`sdg`，uas，無 VM） | 370.3 MB/s | 未測 | 未測 | 未測 | 未測 | — |
+| Linux protected（without-firmware，`--swiotlb 256`） | 234 MB/s | 233.9 MB/s | 388.7 MB/s | 1195 IOPS | 9099 IOPS | 101.2%（/800%） |
+| Linux pseudo-unprotected | 264 MB/s | 263.8 MB/s | 385.5 MB/s | 1330 IOPS | 9791 IOPS | 95.2%（/800%） |
+| Windows pseudo-unprotected | FAILED | FAILED | FAILED | FAILED | FAILED | n/a |
+
+Windows 整列 FAILED 的理由是同一個：磁碟從頭到尾沒列舉出來（`Get-Disk` 只看得到 VirtIO 系統碟，
+沒有任何 PhysicalDrive），因為 crosvm 的 Configure Endpoint 被 `bad stream context type: 0` 打回、
+xHCI 的事件處理器當場被拆掉，一個測項都沒跑到（見下面那條缺陷）。
+
+數字的細節：host 的五次 1M 是 273.0（冷、首次觸碰，排除）、370.3、367.0、373.6、371.3，run2–5 平均
+370.5；另外 bs=4M×500 = 369.0、bs=128k×8000 = 305.0。Linux protected 的兩次 1M 是 229 / 234，
+4M 254、128k 218。Linux pseudo 的四次 1M 是 258 / 264 / 267 / 267（平均 264.2），4M 279、
+128k 194 / 211 / 193。128k 那欄兩邊都噪（193–218），不要當成回歸讀。CPU 是 8 個取樣（每 2 秒）的平均
+（protected 80.7…115、pseudo 78.5…102）；per-thread 兩邊各只有一張快照：protected `xhci` 32.0% /
+`vcpu0` 38.0%，pseudo `xhci` 37.5% / `vcpu0` 29.0%。protected 的 crosvm RES 是 4.0 G、pseudo 是 8.0 G。
+兩邊的 host log 六個看守樣式（`backend rejected transfer` / `endpoint is stalled` / `failed to cancel` /
+`inconsistant state` / `controller stopped` / `lent memory`）全部 0；唯一雜訊是列舉時的
+`transfer ring slot_1 ep_7 is already stopped` 和結束時的 `device detached from port 9`。
+
+**解讀：**
+- 佇列深度一補上，SSD 的全速就回來了：qd8 兩種模式都是 385–389 MB/s，比 host 自己 qd1 的 dd（370）
+  還高一點，代表透傳路徑的**頻寬**不是瓶頸，裝置才是。
+- 單佇列掉掉的是**每筆請求穿過模型的來回延遲**：一條 transfer ring 一次只有一個 URB 在途
+  （ring buffer controller 要等完成才 dequeue 下一個 TD），qd1 的 fio 平均延遲 3.30 ms / 1 MiB
+  ≈ 303 MB/s 的天花板，實測 233.9 / 263.8 就落在這條線下面。
+- protected 與 pseudo 的差（dd 234 vs 264、fio qd1 233.9 vs 263.8）約 11–13%，那就是 swiotlb 反彈的
+  成本：pseudo 整段 RAM 是 shared、沒有 `--swiotlb`，protected 每一筆都得在 256 MiB 的 restricted pool
+  進出一次。qd8 沒有這個差（388.7 vs 385.5），因為那時瓶頸已經在裝置身上。
+- 4K 隨機是同一個形狀：qd1 1195 / 1330 IOPS（平均延遲 616 / 549 µs），qd32 9099 / 9791 IOPS。
+- CPU 大約就是**一顆核心**（101.2% / 95.2% of 800%），`xhci` thread 佔三分之一上下，其餘是 vcpu 的
+  exit 處理。§5 的 R8「USB3 儲存估計 CPU 綁定在幾百 MB/s」成立。
+- 唯一沒法從資料切開的：fio `--size=8G --time_based` 每輪都重讀同一段 8 GiB，qd8 超過 host qd1 這件事
+  既可能是佇列變深、也可能是外接盒/SSD 自己的快取，證據分不出來。
+
+**新缺陷（`11c5462` 仍在，待修）：Windows 的 UASPStor 要 USB 3.0 bulk streams，crosvm 的
+Configure Endpoint 直接拒收，整台 xHCI 就死了。**
+- 現象：13:29:40.360 `usb_hub: backend attached to port 9`，33 ms 後
+  `ERROR devices::utils::event_loop] removing event handler due to error: command ring TRB failed:
+  failed to config endpoint: bad stream context type: 0`（全 log 就這一條）。接著是 13 次
+  `Write to crcr while command ring is running` / 13 次 `xhci: stopping all device slots and resetting
+  host hub`，每 ~10 秒一輪（13:29:45 到 13:31:41）——那是 Windows 的 command-ring watchdog 在重試。
+  Guest 端始終只有 VirtIO 系統碟，沒有任何 PhysicalDrive。
+- 根因：`device_slot.rs:876-886` 的 `create_stream_trcs()` 把主 Stream Context Array 的
+  `1..1<<(max_pstreams+1)` 每一格都讀出來，**只要有一格的 SCT 不是 1（Linear）就整個 Configure Endpoint
+  失敗**；Windows 給的陣列裡有 SCT=0 的格子（未用/停用的 stream，或指到 secondary array），於是回
+  `BadStreamContextType(0)`。Linux 的 uas 沒事，是因為它把每一格都填成 Linear。
+- 第二層傷害：這個錯誤是從 command ring 的 handler 一路往外丟到 `event_loop`，`event_loop` 的處理方式是
+  **把整個事件處理器移除**，之後這台 xHCI 對 guest 就是死的。乾淨 detach + 再 attach 一次驗證過：
+  13:32:14 有 `backend attached to port 9`，之後到 VM 關機為止**沒有任何 xHCI 流量**——處理器一旦拆掉，
+  這台 VM 的生命週期內就回不來了。guest 造成的 context 錯誤本來就該回一個 completion code 給
+  command ring（讓 guest 自己處理），不該拆事件處理器。
+- 附帶：兩份 Linux crosvm log 在 attach **之前**也各有一條同樣的
+  `Write to crcr while command ring is running` 加兩條 `stopping all device slots`（13:11:05 / 13:23:43），
+  是開機期的，之後列舉正常，不影響上面的數字，但那是同一個字串。
 
