@@ -511,6 +511,16 @@ xHCI 模型缺陷——不是 isochronous 的問題。**
     **自己**回來；音訊播放 hw_ptr 44880→93168→141744；裝置掛著 vm_stop → 5 秒內自動釋放回 host。
   - Windows app VM 第一次沒開起來：它的 VM 設定不知何時回到 `protected_without_firmware`（BSOD 0x7B），用
     `vm_modify` 改回 `pseudo_unprotected` 後另行重驗（見下）。
+- Windows app VM 重驗（`vm_modify` 改回 pseudo_unprotected 後，workflow `usb-m6-app-windows` + 審核）：daemon 起的
+  crosvm 帶 `--protected-vm-pseudo-unprotected`；IPC usb_attach 音訊 → PlaySync 5258/5229 ms、兩個 Render endpoint
+  state=1、waveOut=2（播放期間 virtio-snd 沒開 endpoint，證明聲音真的走 USB）；usb_detach 後 1 秒內 host 驅動自己回來；
+  攝影機拍照 45759 B、錄影 19074 B（h264 177 幀/5.9 s ≈ 30 fps）、mic 707438 B（96% 非零樣本）；攝影機掛著 vm_stop
+  → 13 秒內自動釋放；手機乾淨。兩個 app 端（非 USB）的發現：(1) 第一次 vm_start 進了 WinRE（先前 protected 模式
+  BSOD 0x7B 讓 Windows 標記開機失敗），WinRE 沒有 virtio-input 驅動、app 的觸控/鍵盤無效，只能 vm_stop+vm_start；
+  (2) `vm_stop` 是立即斷電（crosvm 0.1 s 內 exit），不是 guest 優雅關機，NTFS 留髒卷、可能再次觸發 WinRE——建議
+  daemon 先送 guest shutdown（ACPI/agent）再收 crosvm。
+- `76ed342`：stream 停止時對已完成 URB 的 DISCARDURB 回 EINVAL，改成 `TransferAlreadyCompleted`、debug 級，不再每次
+  停串流噴數百行 ERROR。
 - **審核員抓到的真問題（`7b6a79c` 修）：Windows selective suspend 喚醒後第一次開啟裝置必失敗。** ETW：閒置 ~14 s
   後裝置 D3、hub D0 Exit；喚醒時 hub 讀 port 1 = `0x507`（suspended），對 port 做 resume 後**等 500 ms 的
   Port Link State Change 事件**——crosvm 的 `portsc_callback` 只把 PLS 寫進去、從不設 PLC、不發 port status change
