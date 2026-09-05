@@ -519,6 +519,16 @@ xHCI 模型缺陷——不是 isochronous 的問題。**
   BSOD 0x7B 讓 Windows 標記開機失敗），WinRE 沒有 virtio-input 驅動、app 的觸控/鍵盤無效，只能 vm_stop+vm_start；
   (2) `vm_stop` 是立即斷電（crosvm 0.1 s 內 exit），不是 guest 優雅關機，NTFS 留髒卷、可能再次觸發 WinRE——建議
   daemon 先送 guest shutdown（ACPI/agent）再收 crosvm。
+- **`76ed342` 驗收（workflow `usb-m6-resume-verify` + 審核）：**
+  - Windows（手動 launcher）：attach 攝影機、閒置 65 s（ETW 證明 D0 Exit→D3 於列舉後 35 s、在 D3 待了 81.7 s）後
+    **第一次**開啟：拍照 45759 B、錄影 19098 B（177 幀）一次成功；再閒置 82.8 s 後 mic 第一次錄音 714494 B
+    一次成功；ETW **Surprise Removal = 0**、兩次喚醒 host log **零** 再列舉；AB13X 閒置 70 s 後第一次 PlaySync
+    5414 ms 一次成功。`failed to cancel` 全 log = 0。
+  - Linux（protected）：播放 hw_ptr 44880→93744→142320、MJPG 640 29.99 fps SOI 90/90、YUYV 剛好 30 幀、
+    攝影機 mic 48000 samples，`failed to cancel` = 0（前一版 62 條）。
+  - 最終 APK（md5 8b521e9…，crosvm 7a371d1…）安裝成功；Ubuntu app 路徑攝影機 30.00 fps、mic 48000、IPC detach
+    後 12 秒內 host 驅動自己回來。Windows app 路徑當輪沒跑成（設定又回 protected，見下一條），另跑
+    `usb-m6-app-windows-final`。
 - **app 端發現：daemon 的 `vm_modify` 不落地。** `VMInstanceStore.modifyVM()` 只換掉記憶體裡的 instance，
   `files/vms.json`（app uid 擁有）只有 UI 會寫；所以 M5 時把 Windows VM 改成 pseudo_unprotected 只活在舊 daemon
   記憶體裡，daemon 一重啟（裝 APK 必經）就回到 protected_without_firmware，Windows 直接 BSOD 0x7B。這次改用
