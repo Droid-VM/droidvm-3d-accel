@@ -519,6 +519,11 @@ xHCI 模型缺陷——不是 isochronous 的問題。**
   BSOD 0x7B 讓 Windows 標記開機失敗），WinRE 沒有 virtio-input 驅動、app 的觸控/鍵盤無效，只能 vm_stop+vm_start；
   (2) `vm_stop` 是立即斷電（crosvm 0.1 s 內 exit），不是 guest 優雅關機，NTFS 留髒卷、可能再次觸發 WinRE——建議
   daemon 先送 guest shutdown（ACPI/agent）再收 crosvm。
+- **app 端發現：daemon 的 `vm_modify` 不落地。** `VMInstanceStore.modifyVM()` 只換掉記憶體裡的 instance，
+  `files/vms.json`（app uid 擁有）只有 UI 會寫；所以 M5 時把 Windows VM 改成 pseudo_unprotected 只活在舊 daemon
+  記憶體裡，daemon 一重啟（裝 APK 必經）就回到 protected_without_firmware，Windows 直接 BSOD 0x7B。這次改用
+  「停 daemon → 以 root 改 vms.json（保留 u0_a359:600）→ 重啟 app」才真正持久。M3/M4 做 app UI 時要一併處理
+  daemon 側修改的持久化（或明確規定只有 UI 能改設定）。
 - `76ed342`：stream 停止時對已完成 URB 的 DISCARDURB 回 EINVAL，改成 `TransferAlreadyCompleted`、debug 級，不再每次
   停串流噴數百行 ERROR。
 - **審核員抓到的真問題（`7b6a79c` 修）：Windows selective suspend 喚醒後第一次開啟裝置必失敗。** ETW：閒置 ~14 s
