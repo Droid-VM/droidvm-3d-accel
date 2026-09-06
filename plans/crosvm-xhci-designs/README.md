@@ -10,3 +10,4 @@ Design records written during the USB passthrough work, one per crosvm defect cl
 | DESIGN-STOPPED-ISO.md | Drained-ahead (isochronous) rings flooded the guest with completions at stop (see the erratum inside) | e5eece2 |
 | DESIGN-STOPPED-STREAMS.md | A stream endpoint stop emitted one Stopped event per stream ring; Windows flagged duplicates | f96fd65 |
 | DESIGN-STREAM-RESTART.md (+ ANALYSIS-STREAM-RESTART.md) | After a stream-endpoint stop the silently rewound stream ring never restarted: crosvm started only the doorbell-addressed ring, hardware resumes every stream | d849baf |
+| DESIGN-STOPPED-DELIVERED.md (+ ANALYSIS-STREAM-RESTART-2.md) | A cancelled URB that had already moved the whole TD was treated as a stop and re-executed; the device never resends that tag (16 s UAS strand on a warm disk) | 2a8e371 |
