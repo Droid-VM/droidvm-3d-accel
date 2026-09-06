@@ -646,9 +646,10 @@ command ring／CRCR／interrupter，開機前就接上的裝置會讓整台 xHCI
     `is already stopped` 0 條（run1 是 1 條 ERROR ＋ 77 條），吞吐量見 §9.3。
 
 **Stop Endpoint 不回報進行中的 TD（沒有 Stopped transfer event），Windows 每次 stop 固定等 2–4 秒——
-已由 crosvm `dc1e0bf` + `9293b36` + `13242f9` + `e5eece2` 四個 commit 修好：Windows 每次 stop 的 4 秒／
-2 秒收斂到 5 ms 以內、Linux 的 isochronous 回歸歸零，2026-09-06（run4）Windows／Linux／app 三條路徑
-都實機驗過；只剩 stream 端點「一次 stop 發了不只一個 Stopped 事件」這個新缺陷待修。**
+已由 crosvm `dc1e0bf` + `9293b36` + `13242f9` + `e5eece2` + `f96fd65` 五個 commit 修好：Windows 每次 stop 的
+4 秒／2 秒收斂到 5 ms 以內、Linux 的 isochronous 回歸歸零、stream 端點的 duplicate Stopped 歸零，
+2026-09-06（run4、run5）Windows／Linux／app 三條路徑都實機驗過；只剩「被默默倒回的那條 stream ring 不會
+重啟」這個缺陷待修——冷接上時仍有機會把另一條 stream 的 URB 晾住 16 秒。**
 - 現象（ETW，scratchpad `m6b/uas/run1` 的 `4W2-etw.txt`、`usbtrace-w*.xml`）：三個週期一模一樣——UAS
   data-in stream 端點（slot 1 DCI 7）的 Stop Endpoint 在 1 ms 內就拿到 completion code 1，接下來
   **4.008／4.015／4.000 秒**之內沒有任何 USBXHCI／UCX／USBHUB3 事件，等滿了才是 Set TR Dequeue，
@@ -799,18 +800,68 @@ command ring／CRCR／interrupter，開機前就接上的裝置會讓整台 xHCI
     mic **64044 B**、`speaker-test` rc=0，`vm_stop` 時歸還；Windows app VM 預先接上攝影機：PnP 全 OK、
     拍照 **182153 B**、錄影 **931222 B**，那一輪唯一的一次 Stop Endpoint 是 **0 ms**。當天 watchdog
     `HOST_REBOOT` **0**、OTG 掉線 **0**。
-- **新缺陷（Windows，run4 抓到；待修，設計 `crosvm-xhci-designs/DESIGN-STOPPED-STREAMS.md`）：stream 端點的一次 Stop Endpoint
-  不能每條 stream ring 各發一個 Stopped 事件。** UAS 冷接上那次，第一個 Stop Endpoint 時有 **兩條 stream**
-  各有一顆 TD 在飛，crosvm 依修法二當初寫下的規則對每一條 stream ring 各發了一個 Stopped；Windows USBXHCI
-  在同一毫秒記下 event 30 `Received duplicate Stopped Transfer Events`（`HWVerifierFlag=0x2000000`），
-  stream 3 那顆 URB 就被晾了 **16.28 秒**，`disk.sys` 的 DeviceStart 拖到 **18.77 秒**（同一輪後面九個週期
-  都只有一條 stream 在飛，全是 0–1 ms）。規範是：有 stream 的端點只有一條 current stream，一次 Stop
-  Endpoint 只發**一個** Stopped 事件。修法（進行中）：一次 stop 在所有 stream ring 之間只發一個事件，
-  其餘的 ring 照樣默默倒回。
+- **修法五（`f96fd65`，設計 `plans/crosvm-xhci-designs/DESIGN-STOPPED-STREAMS.md`）：一次 Stop Endpoint 在所有
+  stream ring 之間只發一個 Stopped 事件。** 機制（run4 抓到的那個新缺陷）：每條 stream ring 各是一個完整的
+  `RingBufferController`，它的 handler 各自擁有一份 `XhciTransferManager`，`record_stopped`／`take_stopped`
+  的去重因此是**每條 ring 一份、跨不了 ring**——UAS 冷接上那次，第一個 Stop Endpoint 時有 **兩條 stream** 各有
+  一顆 TD 在飛（stream 3 那顆是與 Stop Endpoint **同一毫秒**才排上 ring 的，crosvm 處理停止時它已經送出 URB），
+  兩條 ring 就各報了自己那顆被 cancel 的 TD、各發一個 Stopped；Windows USBXHCI 在同一毫秒記下 event 30
+  `Received duplicate Stopped Transfer Events`（`HWVerifierFlag=0x2000000`）、丟掉第二個，它報的那顆 URB 被晾了
+  **16.28 秒**，`disk.sys` 的 DeviceStart 拖到 **18.77 秒**。規範是：有 stream 的端點只有一條 current stream，
+  一次 Stop Endpoint 只發**一個** Stopped 事件（xHCI 1.2 4.12.1.1、4.6.9）。修法：同一個命令的所有 ring 共用
+  一份認領（`Arc<AtomicBool>`）——`stop_endpoint` 的 stream 分支在停下每條有內容的 ring 之前先把同一份認領裝
+  上去，第一條「帶著被 cancel 的 TD」把 stop 收完的 ring 以 compare_exchange 拿走認領並發事件，其餘同樣有被
+  cancel 的 TD 的 ring **照樣默默倒回**（`StoppedTd` 多一個 `reported` 旗標），Stream Context 的 TR Dequeue
+  Pointer 與 DCS 照寫回去，但不發事件、也不動 guest 的 Stopped EDTLA；沒有東西被 cancel 的 ring 不消耗認領，
+  所以「搶在 cancel 之前完成」的那條 stream 保有自己原本的完成事件，而該發的 Stopped 仍然發得出去。認領隨這次
+  stop 被取走、或被下一次 start 丟掉，不會活過自己的命令；沒有 stream 的端點不裝認領，drained-ahead
+  （isochronous）閘門、halt、Reset Endpoint、HCRST 都沒動。審查回合補一條：Stop Endpoint 打在**不是 Running**
+  的端點上要回 Context State Error（4.6.9，比照 `reset_endpoint` 的 Halted 守衛），否則一個違規的、在前一次還
+  沒完成就送出的第二次 Stop Endpoint 會對還在 Stopping 的 ring 重裝一份新認領、再發一個 Stopped（Windows／
+  Linux 都把命令排在自己的完成之後，實際走不到）。host 單元測試 **77 個全過**（`e5eece2` 的 69 ＋ 8）。
 - Watchdog／收尾：兩支 monitor（Windows 段 18:28–18:58、Linux 段 19:03–19:32）`HOST_REBOOT` 都是 **0**、
   host uptime 單調上升；每次 launch 前 `PRECHECK_OK`、launch 後 `POSTLAUNCH_OK served=2048`；每個 guest
   都是從裡面關機、crosvm 自己在 10 秒內退出（沒有 `crosvm stop`、沒有 kill），pool 收回 **3072**、
   `served=0 active_vms=0`，host 端三顆裝置的驅動、`sdg` 與 `public:8,98` 全部還原。
+- **2026-09-06 深夜驗收（run5，5568，crosvm `f96fd65` md5 `ad81e4e4…`，同一支 binary 打包的 APK md5
+  `323f35fb…` 也裝上去跑過，證據在 scratchpad `m6b/uas/run5`）：要修的那條驗證器抱怨歸零，被它蓋住的那個
+  後果沒有跟著好。**
+  - Windows（pseudo-unprotected，手動 launcher；3 次冷開機 attach ＋ 每台 2 次熱插拔＝9 次 attach）：USBXHCI
+    event 30「duplicate Stopped」**0 次**（run4 同一情境必現），11 次 Stop Endpoint 裡有 **9 次**是兩條 stream
+    都有 URB 在飛——稽核員拿 UCX 26/27 的 URB 指標配上 USBXHCI 41 的 `EndpointContextIndex`／`StreamId` 自己
+    重建了一份 in-flight URB 追蹤器，證明那個競態每一次都真的踩到了。每一次 Stop Endpoint 的 completion 與
+    接下來的 Set TR Dequeue 都在 **0–1 ms**（從原始 XML 重算是 0.170–0.922 ms），停滯不在 handshake 上。
+
+| 週期 | duplicate-Stopped | Kernel-PnP 902 | `disk.sys` DeviceStart | 兩條 stream 在飛 | 被晾住的 URB |
+|---|---|---|---|---|---|
+| cold1 冷接 | 0 | 1（3007 ms） | 18685 ms | 是 | stream 2，**16.19 秒** |
+| cold2 冷接 | 0 | 0 | 12 ms | 是 | 無 |
+| cold3 冷接 | 0 | 1（3000 ms） | 16644 ms | 是 | stream 3，**16.13 秒** |
+| 熱插拔 ×6 | 0 | 0 | 6–12 ms | 是 | 無 |
+
+  - Windows 其餘量測：raw 未緩衝讀 **301–317 MB/s**（磁碟全程 Offline／ReadOnly、從頭到尾沒有掛出任何磁碟區），
+    crosvm log 每個 watch pattern 都 0、ERROR **0**——被晾住的那顆 TD，crosvm 一句話都沒印。
+  - Linux（protected-without-firmware）：UAS dd **334／339 MB/s**（run4 是 234／229），新加的兩條 dd 併發
+    （兩條 stream ring 真的同時在飛，`inflight` 看得到 4 筆讀）**198／197 MB/s**；攝影機 6×60 幀 **15.0 fps**、
+    `not part of TD` **0 條**；攝影機 mic `arecord` 192044 B、`speaker-test` rc=0。與 run4 唯一的差別是
+    `f96fd65` 自己加的那條守衛：**`endpoint at index 0 is not running` ERROR ×2**（AB13X 列舉時控制端點被 STALL
+    成 Halted，guest 接著去 dequeue 控制 URB，Stop Endpoint 就打在一個不是 Running 的端點上）——正是設計要的
+    行為，guest 毫無反應、AB13X 照樣出聲，但那是 error! 等級的新噪音，待降級。
+  - App 路徑（APK `323f35fb…`，裡面的 crosvm 就是 `ad81e4e4…`）：安裝成功；Ubuntu 場景 F（VM-start trigger）
+    在 `running` 之後 **9.28／9.48 秒**把兩顆裝置接上，攝影機 3×60 幀 14.98–15.00 fps、`not part of TD` **0**、
+    mic 64044 B、`speaker-test` rc=0；Windows app VM 預先接上攝影機：PnP 全 OK、拍照 177545 B／錄影 908143 B，
+    ETW 的 duplicate-Stopped **0**（但這一輪只過 UVC 攝影機、沒有 stream 端點，競態沒被踩到，那個數字要看上面
+    Windows 那一輪）。三段 monitor 全程 `HOST_REBOOT` **0**。
+- **仍待修（設計 `plans/crosvm-xhci-designs/DESIGN-STREAM-RESTART.md`，進行中）：被默默倒回的那條 stream ring
+  再也沒有動起來。** `f96fd65` 之後一次 stop 只發一個 Stopped，被報的那顆 URB 1 ms 內就以 `0xC0000120` 收掉，
+  另一條 stream 的 URB 則是**什麼都收不到**，一直到 16.1 秒後 UASPStor 的請求計時器逾時、再發一次 Stop
+  Endpoint 才被收走（`e5eece2` 那時是同樣的 16.3 秒外加一句 duplicate-Stopped 抱怨——這次重寫讓驗證器閉了嘴，
+  但沒有把第二條 stream 的 TD 處理掉）。目前的假說：crosvm 只在**那條 stream 自己的 doorbell** 響的時候才重啟
+  一條 stream ring，硬體卻是任何一次 doorbell 就重啟整個端點（所有 stream），所以倒回之後沒有人再去踢它。
+- 稽核員另外記下一條沒有人解釋過的東西：**每一份 Windows trace（含全乾淨的 cold2 與 app 那一輪）都有一個永遠
+  在跑的 ~33 秒 bulk URB 週期落在 DCI 1 上、每次以 `0xC0000120` 收尾**（每份冷 trace 三段 33.0–33.6 秒），收
+  trace 的時候還帶著 `URBs never completed: 1`。過的與不過的 run 都一樣，所以對這個停滯沒有診斷價值（看起來
+  像 detach 時被取消的 long poll），但沒有做過特徵化，也沒有跟 run4 對過基準。
 
 ### 9.2 Windows 重驗（2026-09-05，crosvm `4c6d149` → `d2f4b57`）
 
