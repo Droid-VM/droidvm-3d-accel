@@ -1,8 +1,16 @@
 # USB 透傳：Android 端接線計劃（2026-09-04）
 
-> 狀態（2026-09-04 收工）：§2、§3、§5 階段 A/B 與 M5 已完成並實機驗收（見 USB_PASSTHROUGH_SURVEY.md §8）；
-> §4 app 頁面（M3）未做；§2.4 自動規則（M4）2026-09-05 實作完成，2026-09-06 凌晨第三輪（crosvm `391518c`）
-> 連 VM 開機觸發（F/R/G）與 Windows 開機前就掛規則（WF）都在 guest 端驗過，M4 的四個觸發情境全部端到端通過。
+> 狀態（2026-09-06）：§2、§3、§5 階段 A/B 與 M5 已完成並實機驗收（見 USB_PASSTHROUGH_SURVEY.md §8）；
+> §2.4 自動規則（M4）2026-09-05 實作完成，2026-09-06 凌晨第三輪（crosvm `391518c`）連 VM 開機觸發
+> （F/R/G）與 Windows 開機前就掛規則（WF）都在 guest 端驗過，M4 的四個觸發情境全部端到端通過。
+> **整條 USB 透傳（M6 isochronous ＋ M4 自動規則 ＋ crosvm 的 Stop Endpoint 七連修／streams／HCRST）
+> 到 2026-09-06 為止已經端到端驗收完成**：5568 上裝的是 APK `6727760f…`（crosvm `2a8e371`），
+> Windows pseudo-unprotected、Linux protected 與 app daemon 三條路徑都過（run7，見
+> USB_PASSTHROUGH_SURVEY.md §9.1）。§4 app 頁面（M3）未做。剩下的項目只有三件：
+> (1) UI 在新增 `any` 規則時要警告，並用 dry-run 列出現在會被吸走的裝置；
+> (2) **實體熱拔插**（人把線拔掉）要由使用者親手驗一次，自動化只做過 sysfs 模擬與 IPC detach；
+> (3) `vm_modify` 的持久化——`files/vms.json` 只有 UI 會寫，daemon 側的修改活不過重啟
+> （見 SURVEY §9.1 的 app 端發現），要嘛補上，要嘛明文規定只有 UI 能改設定。
 
 前提（USB_PASSTHROUGH_SURVEY.md 的結論）：Linux guest 走 protected + restricted-dma-pool，
 Windows guest 走 pseudo-unprotected；兩者 host 端機制相同，差別只在 crosvm 的 gate。本文只講
@@ -217,6 +225,12 @@ for d in 候選:
   修好的 binary 上也還在；另外 `xhci: endpoint is stalled. set state to Halted` 的 WARN（F 6 次、R 5 次、
   WF 1 次）與 guest 對音效裝置問 clock frequency（`cannot get freq at ep 0x3/0x83`）的 STALL 對得上，
   判定無害但**沒有真的追到底**。
+- **M4 複驗（2026-09-06，run7，APK `6727760f…`＝crosvm `2a8e371`）**：同一組規則路徑跟著 crosvm 的
+  Stop Endpoint 收尾一起重跑——AF（Ubuntu，裝置層兩顆）`running` 之後 **9.28／9.50 秒**自動接上、
+  AW（Windows，只掛攝影機）**6.29 秒**接走攝影機而 AB13X 與 UNITEK 一路留在 host，兩邊 `vm_stop` 之後
+  1.30／0.30 秒把裝置還給 host 驅動，15 個情境全過（詳見 SURVEY §9.1 的 run7）。順帶一個與 USB 無關的
+  行為變更：這版 APK 沒有 `usb-rules get` 子命令了，直接跑 `droidvm usb-rules` 印出存好的規則
+  （本文件寫的就是後者），舊腳本要跟著改。
 
 ### 2.5 事件時序
 | 事件 | daemon 做什麼 |
