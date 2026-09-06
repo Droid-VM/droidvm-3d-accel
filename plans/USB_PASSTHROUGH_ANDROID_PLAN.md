@@ -149,10 +149,10 @@ for d in 候選:
 重新出現，inotify 看到 CREATE，等同重插）；真實拔插由使用者手動補測。
 
 **M4 實作與驗收紀錄（2026-09-05 晚）**
-- 實作：app `b7bdbe0`（規則模型/引擎/持久化、IPC `usb_rules_get/set/test`、console `usb-rules`、`usb_host_list` 多
-  `id/port/held/auto_rule`、事件 `usb_auto_attached/usb_auto_failed`）、`34d8793`（failed_for 在該 VM 下次 RUNNING
-  清除）、`156c603`（UI：設定 → 虛擬機器 → USB 直通，四層可排序清單、從現插裝置/port 新增、留給 host、dry-run 預覽）、
-  `2b14fb6`（RUNNING 觸發先輪詢 control socket 就緒最多 60 s；連線類失敗不記 failed_for、2 s 後重跑最多 3 次）。
+- 實作：app `9515641`（規則模型/引擎/持久化、IPC `usb_rules_get/set/test`、console `usb-rules`、`usb_host_list` 多
+  `id/port/held/auto_rule`、事件 `usb_auto_attached/usb_auto_failed`）、`de3bec9`（failed_for 在該 VM 下次 RUNNING
+  清除）、`a9ed74a`（UI：設定 → 虛擬機器 → USB 直通，四層可排序清單、從現插裝置/port 新增、留給 host、dry-run 預覽）、
+  `a78d54e`（RUNNING 觸發先輪詢 control socket 就緒最多 60 s；連線類失敗不記 failed_for、2 s 後重跑最多 3 次）。
   JVM 測試 49 個（daemon）+ 7 個（UI）。
 - 5568 實機（workflow `usb-m4-rules-verify` + 審核）：A 無規則不接、B 存檔觸發 port 層、C 手動 detach 後 held 存檔不再接、
   D sysfs 模擬拔插清 held 並觸發接入、E 裝置層第二顆、H 關機 VM 的 port 規則讓給裝置層、I exact 層（錯 port 不接、對
@@ -169,7 +169,7 @@ for d in 候選:
   bootreason=reboot、無 pstore），與 DroidVM 無關、不可重現；watchdog 見 `vmwatch.sh` / `debugloop.md`。
 
 **M4 第二輪驗收（2026-09-05 深夜，APK `0.0.6.r223.gf893906`＝crosvm `11c5462`（app 解出的副本 md5
-`69aa3984be32eeec993c6161b7cdc05d`）＋ daemon `f893906`；workflow ＋ 獨立審核）**
+`69aa3984be32eeec993c6161b7cdc05d`）＋ daemon `f4a6eed`；workflow ＋ 獨立審核）**
 
 | 情境 | daemon 端 | guest 端 |
 |---|---|---|
@@ -200,7 +200,7 @@ for d in 候選:
   （asound card 1+2、`/dev/video2,3`），全程沒有手動還原過任何驅動。
 
 **M4 第三輪驗收（2026-09-06 凌晨，APK `0.0.6.r223.gf893906`（檔案 md5 `1e7f5b95…`）＝crosvm `391518c`
-（app 解出的副本 md5 `b55fcee2…`）＋ daemon `f893906`；workflow ＋ 獨立審核）**
+（app 解出的副本 md5 `b55fcee2…`）＋ daemon `f4a6eed`；workflow ＋ 獨立審核）**
 
 | 情境 | daemon 端 | guest 端 |
 |---|---|---|

@@ -354,11 +354,11 @@ crosvm `wip/usb`：`ddb15e0` 拿掉 gate（protected 類型只在沒有 swiotlb 
 **結論：目標達成。** Linux protected-without-firmware 與 Windows pseudo-unprotected，經 crosvm 手動
 launcher 與 app daemon 兩條路徑，都能 runtime attach 並讀到 USB 裝置。crosvm `wip/usb` 四個 commit：
 `ddb15e0`（gate）、`cb99117`（PCI id）、`94773a3`（PORTSC link state / LWS / HCRST 還原）、`d9735bf`
-（Event Data TRB）；app `1527331`（daemon runtime attach）。尚未做：M3 app UI、M4 自動接入規則、實體拔線
+（Event Data TRB）；app `8849dd1`（daemon runtime attach）。尚未做：M3 app UI、M4 自動接入規則、實體拔線
 測試、protected + Windows 在 UI 上的防呆。已知限制：上游不支援 isochronous（USB 音訊/多數攝影機）、
 USB 2.0 hub 上隨身碟約 15 MB/s。
 
-app `wip/usb`：`1527331` daemon runtime attach（見 USB_PASSTHROUGH_ANDROID_PLAN.md §2、§3；三路
+app `wip/usb`：`8849dd1` daemon runtime attach（見 USB_PASSTHROUGH_ANDROID_PLAN.md §2、§3；三路
 審查後修正：attach 與 VM 停止的競態用 stop-epoch 解、CLI 逾時改成先 waitFor 再 SIGKILL 並 reap、
 attach 失敗也還原 host 驅動、VMM 已不在時 detach 仍可清記錄、daemon 關閉時收尾）。
 
