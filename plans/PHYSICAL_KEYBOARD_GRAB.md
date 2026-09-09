@@ -154,10 +154,22 @@ VNC 的話得把 grab 到的 evdev 轉成 X keysym 再從 app 送出去，是另
 只有鍵盤被獨佔，保護套上的觸控板還是 Android 的。VNC console 那邊已經有
 `requestPointerCapture()` 的先例，要做是同一個形狀，但不在這次範圍。
 
-### 5.3 LED 沒有回寫
-guest 端切 CapsLock 時，crosvm 會把 EV_LED 狀態寫回 socket，而 daemon 這側沒有人讀
-（既有行為，不是這次造成的）。實體鍵盤的燈因此不會亮。真要做的話是同一件事的兩面：讀掉 socket
-回傳的狀態，順手寫進實體鍵盤的 `EV_LED`。
+### 5.3 LED 已回寫（2026-09-09 補完）
+guest 切 CapsLock 時，crosvm 把 `EV_LED` 寫回同一個 socket。daemon 現在會讀（每個 keyboard slot
+一條 reader thread），拿到之後做兩件事：寫進被 grab 的實體鍵盤（fd 當初就是用 `O_RDWR` 開的），
+以及回報給 console。**guest 沒說過的燈就是「未知」**，不猜 —— virtio-input 沒有查詢的辦法。
+順帶把「只寫不讀、buffer 只進不出」的既有隱患補掉。
+
+實測（5567，Ubuntu guest，2026-09-09）：guest 端 `echo 1 > /sys/class/leds/input4::capslock/brightness`
+→ `kbd_status` 的 `leds.caps` 變 `true`、主機 `/sys/class/leds/input21::capslock/brightness` 變 1
+（實體鍵盤的燈真的亮）；寫 0 則兩邊都回到 0。另一個螢幕（simplefb，guest 的 `input7`）的 LED 變化
+被正確忽略，因為 target 是 gpu-0。
+
+### 5.3.1 螢幕鍵盤跟著實體鍵盤亮
+新的 oneway AIDL `IPhysicalKeyEcho`：daemon **送完 guest 之後**把同一批 key 回呼給 console，只在
+LAPTOP 模式註冊。畫面上的鍵亮不亮 = 「面板黏著 ∨ 實體按住 ∨ guest 說鎖定開著」的聯集，所以實體
+Ctrl 放開不會熄掉面板黏著的 Ctrl；按住實體 Shift 時鍵面也會換成上檔字元。`KeyCodeMapper` 補了
+evdev → Android keycode 的反向表（在填正向表時順手建，第一個寫入者勝出）。
 
 ### 5.4 和 USB 透傳的關係
 被透傳到 guest 的 USB 鍵盤由 usbfs 佔住，主機端根本沒有 evdev 節點，所以掃不到也不會搶 —— 兩套
@@ -166,6 +178,25 @@ guest 端切 CapsLock 時，crosvm 會把 EV_LED 狀態寫回 socket，而 daemo
 
 ### 5.5 逃生鍵未綁定
 見 §2.7。
+
+## 5.6 部署陷阱：APK 更新不會重解 prebuilt
+
+`adb install -r` 之後，app **不會**自動把 APK 裡的 crosvm 解到 `/data/data/.../usr/bin/`；解壓是
+setup wizard 的步驟，而升級後直接進 MainActivity 時那一步不會跑。2026-09-09 就踩到：新 APK 裝好、
+daemon 重啟了，跑的還是舊 binary（`73d5997…`），所以 §1.2 的能力表修正沒有生效。手動修正：
+
+```
+adb push crosvm_out/crosvm /data/local/tmp/crosvm.new
+su -c 'cat /data/local/tmp/crosvm.new > /data/data/cn.classfun.droidvm/usr/bin/crosvm
+       chown u0_a145:u0_a145 ... ; chmod 755 ... ; restorecon ...'
+```
+
+換完之後 guest 端驗證（Ubuntu）：virtio 鍵盤的 `B: KEY=` 位元圖現在有 125/126（META）、86、183、
+164，一路到 248，並且正確停在 272（BTN_LEFT）之前。
+
+**順帶更正一筆觀察**：在舊 binary 上 Windows guest 的 Win 鍵是會動的，也就是 Windows 的 VioInput
+並不照 EV_KEY 位元圖過濾（它自己生一份通用鍵盤 HID descriptor）；Linux 的 input core 則會照著丟。
+所以 §1.2 那個修正對 Linux guest 是必要的，對 Windows 是「本來就矇對」。
 
 ## 6. 驗證計畫（5567，Windows 11 ARM64 guest）
 
